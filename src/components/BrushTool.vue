@@ -53,6 +53,9 @@ onMounted(() => {
         });
         layer.add(line);
       }
+    } else if (e.target.attrs.dash) {
+      // Prevent drawing on locked shapes
+      return;
     } else {
       // Select an existing shape
       selectedShape.value = e.target as Konva.Line;
@@ -76,7 +79,6 @@ onMounted(() => {
     if (line) {
       line.closed(true);
       line.fill(brushColor.value); // Fill with the selected brush color
-      line.listening(false); // Lock the shape immediately after drawing
       layer.batchDraw();
       line = null;
     }
@@ -94,6 +96,19 @@ onMounted(() => {
 function lockShape() {
   if (selectedShape.value) {
     selectedShape.value.listening(false); // Lock the shape
+
+    // Add a dotted overlay to indicate the shape is locked
+    const overlay = new Konva.Line({
+      points: selectedShape.value.points(),
+      stroke: '#ff0000', // Overlay color
+      strokeWidth: selectedShape.value.strokeWidth(),
+      dash: [10, 5], // Dotted line pattern
+      closed: true,
+    });
+
+    layerRef.value?.add(overlay);
+    layerRef.value?.batchDraw();
+
     selectedShape.value = null; // Deselect the shape
   }
 }
