@@ -1,8 +1,9 @@
 <template>
   <div id="container"></div>
   <div class="controls">
-    <input type="color" v-model="brushColor" />
-    <input type="range" min="1" max="50" v-model="brushSize" />
+    <input type="color" v-model="fillColor" />
+    <input type="range" min="1" max="50" v-model="borderSize" />
+    <button @click="activateEraser">Eraser</button>
   </div>
 </template>
 
@@ -13,8 +14,9 @@ import Konva from 'konva';
 const stageRef = ref<Konva.Stage | null>(null);
 const layerRef = ref<Konva.Layer | null>(null);
 const isDrawing = ref(false);
-const brushColor = ref('#000000'); // Default brush color
-const brushSize = ref(5);
+const isEraserActive = ref(false);
+const fillColor = ref('#ff0000'); // Default fill color
+const borderSize = ref(5);
 
 onMounted(() => {
   const width = 800; // Minimum width
@@ -39,13 +41,12 @@ onMounted(() => {
     const pos = stage.getPointerPosition();
     if (pos) {
       line = new Konva.Line({
-        stroke: brushColor.value,
-        strokeWidth: brushSize.value,
+        stroke: isEraserActive.value ? '#ffffff' : '#000000', // Use white for eraser
+        strokeWidth: borderSize.value,
         lineCap: 'round',
         lineJoin: 'round',
         points: [pos.x, pos.y],
-        closed: true, // Close the shape
-        fill: brushColor.value, // Fill with the selected color
+        closed: false, // Open shape for border only
       });
       layer.add(line);
     }
@@ -58,27 +59,36 @@ onMounted(() => {
     if (pos) {
       const newPoints = line.points().concat([pos.x, pos.y]);
       line.points(newPoints);
-      line.strokeWidth(brushSize.value);
+      line.strokeWidth(borderSize.value);
       layer.batchDraw();
     }
   });
 
   stage.on('mouseup touchend', () => {
     isDrawing.value = false;
-    if (line) {
-      line.fill(brushColor.value); // Ensure the shape is filled
-      line = null;
+    if (line && !isEraserActive.value) {
+      line.closed(true); // Close the shape
+      line.fill(fillColor.value); // Fill with the selected color
+      layer.batchDraw();
+    }
+    line = null;
+    if (isEraserActive.value) {
+      isEraserActive.value = false; // Switch back to brush tool
     }
   });
 
   stage.on('mouseenter', () => {
-    stage.container().style.cursor = 'url(brush-icon.png), auto'; // Ensure this path is correct
+    stage.container().style.cursor = isEraserActive.value ? 'not-allowed' : 'crosshair'; // Change cursor based on mode
   });
 
   stage.on('mouseleave', () => {
-    stage.container().style.cursor = 'default';
+    stage.container().style.cursor = 'default'; // Reset cursor to default
   });
 });
+
+function activateEraser() {
+  isEraserActive.value = true;
+}
 </script>
 
 <style scoped>
