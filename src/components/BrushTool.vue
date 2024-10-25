@@ -19,6 +19,8 @@ const brushColor = ref('#000000');
 const borderSize = ref(5);
 const imageRef = ref<Konva.Image | null>(null);
 const isErasing = ref(false);
+const currentLine = ref<Konva.Line | null>(null);
+const lastPointerPosition = ref<Konva.Vector2d | null>(null);
 
 onMounted(() => {
   const stage = new Konva.Stage({
@@ -37,24 +39,15 @@ onMounted(() => {
 });
 
 function setupEventListeners(stage: Konva.Stage, layer: Konva.Layer) {
-  let line: Konva.Line | null = null;
-
-  stage.on('mousedown touchstart', () => {
+  stage.on('mousedown touchstart', (e) => {
     isDrawing.value = true;
     const pos = stage.getPointerPosition();
     if (pos) {
+      lastPointerPosition.value = pos;
       if (isErasing.value) {
-        erase(pos);
+        startErasing(pos, layer);
       } else {
-        line = new Konva.Line({
-          stroke: brushColor.value,
-          strokeWidth: borderSize.value,
-          lineCap: 'round',
-          lineJoin: 'round',
-          points: [pos.x, pos.y],
-          closed: false,
-        });
-        layer.add(line);
+        startDrawing(pos, layer);
       }
     }
   });
@@ -63,25 +56,19 @@ function setupEventListeners(stage: Konva.Stage, layer: Konva.Layer) {
     if (!isDrawing.value) return;
 
     const pos = stage.getPointerPosition();
-    if (pos) {
+    if (pos && lastPointerPosition.value) {
       if (isErasing.value) {
-        erase(pos);
-      } else if (line) {
-        const newPoints = line.points().concat([pos.x, pos.y]);
-        line.points(newPoints);
-        layer.batchDraw();
+        continueErasing(pos);
+      } else {
+        continueDrawing(lastPointerPosition.value, pos);
       }
+      lastPointerPosition.value = pos;
     }
   });
 
   stage.on('mouseup touchend', () => {
     isDrawing.value = false;
-    if (line) {
-      line.closed(true);
-      line.fill(brushColor.value);
-      layer.batchDraw();
-      line = null;
-    }
+    currentLine.value = null;
   });
 
   stage.on('mouseenter', () => {
@@ -93,15 +80,67 @@ function setupEventListeners(stage: Konva.Stage, layer: Konva.Layer) {
   });
 }
 
-function erase(pos: { x: number; y: number }) {
-  const layer = layerRef.value;
-  const stage = stageRef.value;
-  if (!layer || !stage) return;
+function startDrawing(pos: Konva.Vector2d, layer: Konva.Layer) {
+  const newLine = new Konva.Line({
+    stroke: brushColor.value,
+    strokeWidth: borderSize.value,
+    lineCap: 'round',
+    lineJoin: 'round',
+    points: [pos.x, pos.y],
+    globalCompositeOperation: 'source-over',
+  });
+  layer.add(newLine);
+  currentLine.value = newLine;
+}
 
-  const shape = stage.getIntersection(pos);
-  if (shape && shape.getClassName() === 'Line') {
-    shape.destroy();
-    layer.batchDraw();
+function continueDrawing(lastPos: Konva.Vector2d, newPos: Konva.Vector2d) {
+  if (currentLine.value) {
+    const newPoints = currentLine.value.points().concat([newPos.x, newPos.y]);
+    currentLine.value.points(newPoints);
+    
+    // Check if a shape is formed and fill it
+    if (newPoints.length >= 6 && 
+        Math.abs(newPoints[0] - newPos.x) < 5 && 
+        Math.abs(newPoints[1] - newPos.y) < 5) {
+      fillShape(currentLine.value);
+    }
+    
+    layerRef.value?.batchDraw();
+  }
+}
+
+function fillShape(line: Konva.Line) {
+  const points = line.points();
+  const shape = new Konva.Line({
+    points: points,
+    fill: brushColor.value,
+    closed: true,
+    globalCompositeOperation: 'source-over',
+  });
+  layerRef.value?.add(shape);
+  line.destroy();
+  currentLine.value = null;
+}
+
+function startErasing(pos: Konva.Vector2d, layer: Konva.Layer) {
+  const newEraserLine = new Konva.Line({
+    stroke: '#ffffff',
+    strokeWidth: borderSize.value * 2,
+    lineCap: 'round',
+    lineJoin: 'round',
+    points: [pos.x, pos.y],
+    globalCompositeOperation: 'destination-out',
+    listening: false,
+  });
+  layer.add(newEraserLine);
+  currentLine.value = newEraserLine;
+}
+
+function continueErasing(pos: Konva.Vector2d) {
+  if (currentLine.value) {
+    const newPoints = currentLine.value.points().concat([pos.x, pos.y]);
+    currentLine.value.points(newPoints);
+    layerRef.value?.batchDraw();
   }
 }
 
