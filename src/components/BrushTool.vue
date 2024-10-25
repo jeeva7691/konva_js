@@ -5,6 +5,19 @@
     <input type="range" min="1" max="50" v-model="borderSize" />
     <button @click="toggleEraser">{{ isErasing ? 'Draw' : 'Erase' }}</button>
     <input type="file" @change="loadImage" />
+    <!-- New controls -->
+    <select v-model="currentTool">
+      <option value="brush">Brush</option>
+      <option value="pen">Pen</option>
+    </select>
+    <input type="range" min="0" max="1" step="0.1" v-model="opacity" />
+    <input type="checkbox" v-model="lockSegmentation" />
+    <select v-model="overwriteMode">
+      <option value="overwrite">Overwrite unlocked segments</option>
+      <option value="noOverwrite">Do not overwrite segments</option>
+    </select>
+    <input type="text" v-model="currentTaxonomy" placeholder="Taxonomy" />
+    <button @click="createNewSegment">New Segment</button>
   </div>
 </template>
 
@@ -21,6 +34,15 @@ const imageRef = ref<Konva.Image | null>(null);
 const isErasing = ref(false);
 const currentLine = ref<Konva.Line | null>(null);
 const lastPointerPosition = ref<Konva.Vector2d | null>(null);
+
+// New refs
+const currentTool = ref<'brush' | 'pen'>('brush');
+const opacity = ref(1);
+const lockSegmentation = ref(false);
+const overwriteMode = ref<'overwrite' | 'noOverwrite'>('overwrite');
+const currentTaxonomy = ref('');
+const segments = ref<Konva.Group[]>([]);
+const penPoints = ref<Konva.Vector2d[]>([]);
 
 onMounted(() => {
   const stage = new Konva.Stage({
@@ -40,9 +62,22 @@ onMounted(() => {
 
 function setupEventListeners(stage: Konva.Stage, layer: Konva.Layer) {
   stage.on('mousedown touchstart', (e) => {
-    isDrawing.value = true;
     const pos = stage.getPointerPosition();
-    if (pos) {
+    if (!pos) return;
+
+    if (currentTool.value === 'pen') {
+      // Add point to penPoints
+      penPoints.value.push(pos);
+
+      // Check if the new point closes the shape
+      if (penPoints.value.length > 2 && isCloseToStart(pos, penPoints.value[0])) {
+        closePenShape(layer);
+      } else {
+        // Draw a line segment to the new point
+        drawPenSegment(layer, pos);
+      }
+    } else {
+      isDrawing.value = true;
       lastPointerPosition.value = pos;
       if (isErasing.value) {
         startErasing(pos, layer);
@@ -72,7 +107,7 @@ function setupEventListeners(stage: Konva.Stage, layer: Konva.Layer) {
   });
 
   stage.on('mouseenter', () => {
-    stage.container().style.cursor = isErasing.value ? 'crosshair' : 'default';
+    stage.container().style.cursor = currentTool.value === 'pen' ? 'crosshair' : 'default';
   });
 
   stage.on('mouseleave', () => {
@@ -81,20 +116,39 @@ function setupEventListeners(stage: Konva.Stage, layer: Konva.Layer) {
 }
 
 function startDrawing(pos: Konva.Vector2d, layer: Konva.Layer) {
-  const newLine = new Konva.Line({
-    stroke: brushColor.value,
-    strokeWidth: borderSize.value,
-    lineCap: 'round',
-    lineJoin: 'round',
-    points: [pos.x, pos.y],
-    globalCompositeOperation: 'source-over',
-  });
-  layer.add(newLine);
-  currentLine.value = newLine;
+  if (currentTool.value === 'brush') {
+    const newLine = new Konva.Line({
+      stroke: brushColor.value,
+      strokeWidth: borderSize.value,
+      lineCap: 'round',
+      lineJoin: 'round',
+      points: [pos.x, pos.y],
+      globalCompositeOperation: 'source-over',
+    });
+    layer.add(newLine);
+    currentLine.value = newLine;
+  } else if (currentTool.value === 'pen') {
+    penPoints.value = [pos];
+    const newLine = new Konva.Line({
+      points: [pos.x, pos.y],
+      stroke: brushColor.value,
+      strokeWidth: borderSize.value,
+      opacity: opacity.value,
+      lineCap: 'round',
+      lineJoin: 'round',
+    });
+    layer.add(newLine);
+    currentLine.value = newLine;
+  }
 }
 
 function continueDrawing(lastPos: Konva.Vector2d, newPos: Konva.Vector2d) {
-  if (currentLine.value) {
+  if (!currentLine.value) {
+    console.warn('No active line to continue drawing');
+    return;
+  }
+
+  if (currentTool.value === 'brush') {
     const newPoints = currentLine.value.points().concat([newPos.x, newPos.y]);
     currentLine.value.points(newPoints);
     
@@ -106,18 +160,35 @@ function continueDrawing(lastPos: Konva.Vector2d, newPos: Konva.Vector2d) {
     }
     
     layerRef.value?.batchDraw();
+  } else if (currentTool.value === 'pen') {
+    penPoints.value.push(newPos);
+    currentLine.value.points(penPoints.value.flatMap(p => [p.x, p.y]));
+    layerRef.value?.batchDraw();
   }
 }
 
 function fillShape(line: Konva.Line) {
+  if (!layerRef.value) return;
+
   const points = line.points();
-  const shape = new Konva.Line({
-    points: points,
+  const shape = new Konva.Shape({
+    sceneFunc: (context, shape) => {
+      context.beginPath();
+      context.moveTo(points[0], points[1]);
+      for (let i = 2; i < points.length; i += 2) {
+        context.lineTo(points[i], points[i + 1]);
+      }
+      context.closePath();
+      context.fillStrokeShape(shape);
+    },
     fill: brushColor.value,
+    stroke: brushColor.value,
+    strokeWidth: borderSize.value,
     closed: true,
     globalCompositeOperation: 'source-over',
   });
-  layerRef.value?.add(shape);
+
+  layerRef.value.add(shape);
   line.destroy();
   currentLine.value = null;
 }
@@ -186,12 +257,78 @@ function loadImage(event: Event) {
   reader.readAsDataURL(file);
 }
 
+function endDrawing() {
+  if (currentTool.value === 'pen' && penPoints.value.length > 2) {
+    const shape = new Konva.Line({
+      points: penPoints.value.flatMap(p => [p.x, p.y]),
+      fill: brushColor.value,
+      stroke: brushColor.value,
+      strokeWidth: borderSize.value,
+      opacity: opacity.value,
+      closed: true,
+    });
+    layerRef.value?.add(shape);
+    currentLine.value?.destroy();
+    currentLine.value = null;
+    penPoints.value = [];
+  }
+}
+
+function createNewSegment() {
+  const group = new Konva.Group({
+    name: currentTaxonomy.value,
+    draggable: !lockSegmentation.value,
+  });
+  layerRef.value?.add(group);
+  segments.value.push(group);
+}
+
 // Watch for changes in brushColor and borderSize
-watch([brushColor, borderSize], () => {
+watch([brushColor, borderSize, opacity], () => {
   if (stageRef.value) {
     stageRef.value.container().style.cursor = 'crosshair';
   }
 });
+
+// New watch for lockSegmentation
+watch(lockSegmentation, (newValue) => {
+  segments.value.forEach(segment => {
+    segment.draggable(!newValue);
+  });
+});
+
+function drawPenSegment(layer: Konva.Layer, pos: Konva.Vector2d) {
+  const newLine = new Konva.Line({
+    points: penPoints.value.flatMap(p => [p.x, p.y]),
+    stroke: brushColor.value,
+    strokeWidth: borderSize.value,
+    lineCap: 'round',
+    lineJoin: 'round',
+  });
+  layer.add(newLine);
+  currentLine.value = newLine;
+  layer.batchDraw();
+}
+
+function isCloseToStart(pos: Konva.Vector2d, start: Konva.Vector2d): boolean {
+  const distance = Math.sqrt(Math.pow(pos.x - start.x, 2) + Math.pow(pos.y - start.y, 2));
+  return distance < 10; // Adjust the threshold as needed
+}
+
+function closePenShape(layer: Konva.Layer) {
+  const shape = new Konva.Line({
+    points: penPoints.value.flatMap(p => [p.x, p.y]),
+    fill: brushColor.value,
+    stroke: brushColor.value,
+    strokeWidth: borderSize.value,
+    closed: true,
+  });
+  layer.add(shape);
+  currentLine.value?.destroy();
+  currentLine.value = null;
+  penPoints.value = [];
+  layer.batchDraw();
+}
 </script>
 
 <style scoped>
