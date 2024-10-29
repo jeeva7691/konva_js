@@ -19,6 +19,12 @@
     <input type="text" v-model="currentTaxonomy" placeholder="Taxonomy" />
     <button @click="createNewSegment">New Segment</button>
   </div>
+  <!-- Add transformer controls that appear when a shape is selected -->
+  <div v-if="selectedShape" class="shape-controls">
+    <button @click="toggleShapeLock">
+      {{ isShapeLocked(selectedShape) ? '🔒' : '🔓' }}
+    </button>
+  </div>
 </template>
 
 <script setup lang="ts">
@@ -44,6 +50,11 @@ const currentTaxonomy = ref('');
 const segments = ref<Konva.Group[]>([]);
 const penPoints = ref<Konva.Vector2d[]>([]);
 
+// Add new refs
+const selectedShape = ref<Konva.Line | null>(null);
+const lockedShapes = ref<Set<Konva.Line>>(new Set());
+const transformer = ref<Konva.Transformer | null>(null);
+
 onMounted(() => {
   const stage = new Konva.Stage({
     container: 'container',
@@ -58,6 +69,18 @@ onMounted(() => {
   layerRef.value = layer;
 
   setupEventListeners(stage, layer);
+
+  // Add transformer
+  const tr = new Konva.Transformer({
+    nodes: [],
+    visible: false,
+    rotateEnabled: false,
+    borderStroke: '#00ff00',
+    borderStrokeWidth: 2,
+  });
+  
+  layerRef.value?.add(tr);
+  transformer.value = tr;
 });
 
 function setupEventListeners(stage: Konva.Stage, layer: Konva.Layer) {
@@ -68,6 +91,9 @@ function setupEventListeners(stage: Konva.Stage, layer: Konva.Layer) {
     if (currentTool.value === 'pen') {
       // Add point to penPoints
       penPoints.value.push(pos);
+
+      // Draw the point
+      drawPenPoint(layer, pos);
 
       // Check if the new point closes the shape
       if (penPoints.value.length > 2 && isCloseToStart(pos, penPoints.value[0])) {
@@ -113,56 +139,64 @@ function setupEventListeners(stage: Konva.Stage, layer: Konva.Layer) {
   stage.on('mouseleave', () => {
     stage.container().style.cursor = 'default';
   });
+
+  // Add click handler to clear selection when clicking canvas
+  stage.on('click tap', () => {
+    if (stage.getPointerPosition()) {
+      selectedShape.value = null;
+      if (transformer.value) {
+        transformer.value.visible(false);
+      }
+      layer.batchDraw();
+    }
+  });
 }
 
 function startDrawing(pos: Konva.Vector2d, layer: Konva.Layer) {
-  if (currentTool.value === 'brush') {
-    const newLine = new Konva.Line({
-      stroke: brushColor.value,
-      strokeWidth: borderSize.value,
-      lineCap: 'round',
-      lineJoin: 'round',
-      points: [pos.x, pos.y],
-      globalCompositeOperation: 'source-over',
-    });
-    layer.add(newLine);
-    currentLine.value = newLine;
-  } else if (currentTool.value === 'pen') {
-    penPoints.value = [pos];
-    const newLine = new Konva.Line({
-      points: [pos.x, pos.y],
-      stroke: brushColor.value,
-      strokeWidth: borderSize.value,
-      opacity: opacity.value,
-      lineCap: 'round',
-      lineJoin: 'round',
-    });
-    layer.add(newLine);
-    currentLine.value = newLine;
-  }
+  const newLine = new Konva.Line({
+    points: [pos.x, pos.y],
+    stroke: brushColor.value,
+    strokeWidth: borderSize.value,
+    lineCap: 'round',
+    lineJoin: 'round',
+    globalCompositeOperation: 'source-over',
+  });
+  
+  layer.add(newLine);
+  currentLine.value = newLine;
 }
 
 function continueDrawing(lastPos: Konva.Vector2d, newPos: Konva.Vector2d) {
-  if (!currentLine.value) {
-    console.warn('No active line to continue drawing');
-    return;
-  }
+  if (!currentLine.value) return;
 
   if (currentTool.value === 'brush') {
-    const newPoints = currentLine.value.points().concat([newPos.x, newPos.y]);
+    const newPoint = { x: newPos.x, y: newPos.y };
+    
+    // Check for intersections with locked shapes
+    for (const shape of lockedShapes.value) {
+      if (shape === currentLine.value) continue;
+      
+      // Check if the new point intersects with the shape
+      const intersects = shape.intersects({
+        x: newPos.x,
+        y: newPos.y,
+      });
+      
+      if (intersects) {
+        return;
+      }
+    }
+
+    const newPoints = currentLine.value.points().concat([newPoint.x, newPoint.y]);
     currentLine.value.points(newPoints);
     
-    // Check if a shape is formed and fill it
+    // Check if shape should be closed and filled
     if (newPoints.length >= 6 && 
-        Math.abs(newPoints[0] - newPos.x) < 5 && 
-        Math.abs(newPoints[1] - newPos.y) < 5) {
+        Math.abs(newPoints[0] - newPoint.x) < 5 && 
+        Math.abs(newPoints[1] - newPoint.y) < 5) {
       fillShape(currentLine.value);
     }
     
-    layerRef.value?.batchDraw();
-  } else if (currentTool.value === 'pen') {
-    penPoints.value.push(newPos);
-    currentLine.value.points(penPoints.value.flatMap(p => [p.x, p.y]));
     layerRef.value?.batchDraw();
   }
 }
@@ -171,23 +205,18 @@ function fillShape(line: Konva.Line) {
   if (!layerRef.value) return;
 
   const points = line.points();
-  const shape = new Konva.Shape({
-    sceneFunc: (context, shape) => {
-      context.beginPath();
-      context.moveTo(points[0], points[1]);
-      for (let i = 2; i < points.length; i += 2) {
-        context.lineTo(points[i], points[i + 1]);
-      }
-      context.closePath();
-      context.fillStrokeShape(shape);
-    },
+  // Create a polygon instead of a generic shape
+  const shape = new Konva.Line({
+    points: points,
     fill: brushColor.value,
     stroke: brushColor.value,
     strokeWidth: borderSize.value,
     closed: true,
+    draggable: true,
     globalCompositeOperation: 'source-over',
   });
 
+  setupShapeEvents(shape);
   layerRef.value.add(shape);
   line.destroy();
   currentLine.value = null;
@@ -298,15 +327,33 @@ watch(lockSegmentation, (newValue) => {
 });
 
 function drawPenSegment(layer: Konva.Layer, pos: Konva.Vector2d) {
-  const newLine = new Konva.Line({
-    points: penPoints.value.flatMap(p => [p.x, p.y]),
-    stroke: brushColor.value,
-    strokeWidth: borderSize.value,
-    lineCap: 'round',
-    lineJoin: 'round',
+  if (currentLine.value) {
+    // Update existing line
+    const newPoints = currentLine.value.points().concat([pos.x, pos.y]);
+    currentLine.value.points(newPoints);
+  } else {
+    // Create new line
+    const newLine = new Konva.Line({
+      points: penPoints.value.flatMap(p => [p.x, p.y]),
+      stroke: brushColor.value,
+      strokeWidth: borderSize.value,
+      lineCap: 'round',
+      lineJoin: 'round',
+    });
+    layer.add(newLine);
+    currentLine.value = newLine;
+  }
+  layer.batchDraw();
+}
+
+function drawPenPoint(layer: Konva.Layer, pos: Konva.Vector2d) {
+  const point = new Konva.Circle({
+    x: pos.x,
+    y: pos.y,
+    radius: borderSize.value / 2,
+    fill: brushColor.value,
   });
-  layer.add(newLine);
-  currentLine.value = newLine;
+  layer.add(point);
   layer.batchDraw();
 }
 
@@ -329,6 +376,51 @@ function closePenShape(layer: Konva.Layer) {
   penPoints.value = [];
   layer.batchDraw();
 }
+
+// Add new functions for shape selection and locking
+function setupShapeEvents(shape: Konva.Line) {
+  shape.on('click tap', () => {
+    if (isShapeLocked(shape)) return;
+    
+    selectedShape.value = shape;
+    if (transformer.value) {
+      transformer.value.nodes([shape]);
+      transformer.value.visible(true);
+    }
+    layerRef.value?.batchDraw();
+  });
+
+  shape.on('mouseenter', () => {
+    if (!isShapeLocked(shape)) {
+      document.body.style.cursor = 'pointer';
+    }
+  });
+
+  shape.on('mouseleave', () => {
+    document.body.style.cursor = 'default';
+  });
+}
+
+function isShapeLocked(shape: Konva.Line): boolean {
+  return lockedShapes.value.has(shape);
+}
+
+function toggleShapeLock() {
+  if (!selectedShape.value) return;
+
+  if (isShapeLocked(selectedShape.value)) {
+    lockedShapes.value.delete(selectedShape.value);
+    selectedShape.value.draggable(true);
+  } else {
+    lockedShapes.value.add(selectedShape.value);
+    selectedShape.value.draggable(false);
+    if (transformer.value) {
+      transformer.value.visible(false);
+    }
+    selectedShape.value = null;
+  }
+  layerRef.value?.batchDraw();
+}
 </script>
 
 <style scoped>
@@ -343,4 +435,27 @@ function closePenShape(layer: Konva.Layer) {
   display: flex;
   gap: 10px;
 }
+/* Add new styles */
+.shape-controls {
+  position: absolute;
+  background: white;
+  padding: 5px;
+  border-radius: 4px;
+  box-shadow: 0 2px 4px rgba(0,0,0,0.2);
+  z-index: 1000;
+}
+
+.shape-controls button {
+  padding: 4px 8px;
+  cursor: pointer;
+  font-size: 1.2em;
+  background: none;
+  border: 1px solid #ccc;
+  border-radius: 4px;
+}
+
+.shape-controls button:hover {
+  background: #f0f0f0;
+}
 </style>
+
