@@ -160,6 +160,7 @@ function startDrawing(pos: Konva.Vector2d, layer: Konva.Layer) {
     lineCap: 'round',
     lineJoin: 'round',
     globalCompositeOperation: 'source-over',
+    opacity: opacity.value,
   });
   
   layer.add(newLine);
@@ -169,24 +170,10 @@ function startDrawing(pos: Konva.Vector2d, layer: Konva.Layer) {
 function continueDrawing(lastPos: Konva.Vector2d, newPos: Konva.Vector2d) {
   if (!currentLine.value) return;
 
-  if (currentTool.value === 'brush') {
-    const newPoint = { x: newPos.x, y: newPos.y };
-    
-    // Check for intersections with locked shapes
-    for (const shape of lockedShapes.value) {
-      if (shape === currentLine.value) continue;
-      
-      // Check if the new point intersects with the shape
-      const intersects = shape.intersects({
-        x: newPos.x,
-        y: newPos.y,
-      });
-      
-      if (intersects) {
-        return;
-      }
-    }
+  const newPoint = { x: newPos.x, y: newPos.y };
 
+  if (currentTool.value === 'brush') {
+    // Brush tool logic
     const newPoints = currentLine.value.points().concat([newPoint.x, newPoint.y]);
     currentLine.value.points(newPoints);
     
@@ -197,23 +184,27 @@ function continueDrawing(lastPos: Konva.Vector2d, newPos: Konva.Vector2d) {
       fillShape(currentLine.value);
     }
     
-    layerRef.value?.batchDraw();
+  } else if (currentTool.value === 'pen') {
+    // Pen tool logic
+    penPoints.value.push(newPoint);
+    drawPenSegment(layer, newPos); // Call the existing function for pen drawing
   }
+
+  layerRef.value?.batchDraw();
 }
 
 function fillShape(line: Konva.Line) {
   if (!layerRef.value) return;
 
   const points = line.points();
-  // Create a polygon instead of a generic shape
   const shape = new Konva.Line({
     points: points,
-    fill: brushColor.value,
     stroke: brushColor.value,
     strokeWidth: borderSize.value,
     closed: true,
     draggable: true,
     globalCompositeOperation: 'source-over',
+    opacity: opacity.value,
   });
 
   setupShapeEvents(shape);
@@ -229,8 +220,8 @@ function startErasing(pos: Konva.Vector2d, layer: Konva.Layer) {
     lineCap: 'round',
     lineJoin: 'round',
     points: [pos.x, pos.y],
-    globalCompositeOperation: 'destination-out',
-    listening: false,
+    globalCompositeOperation: 'source-over',
+    listening: true,
   });
   layer.add(newEraserLine);
   currentLine.value = newEraserLine;
@@ -421,6 +412,7 @@ function toggleShapeLock() {
   }
   layerRef.value?.batchDraw();
 }
+
 </script>
 
 <style scoped>
