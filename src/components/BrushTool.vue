@@ -1,29 +1,132 @@
 <template>
-  <div id="container"></div>
-  <div class="controls">
-    <input type="color" v-model="brushColor" />
-    <input type="range" min="1" max="50" v-model="borderSize" />
-    <button @click="toggleEraser">{{ isErasing ? 'Draw' : 'Erase' }}</button>
-    <input type="file" @change="loadImage" />
-    <!-- New controls -->
-    <select v-model="currentTool">
-      <option value="brush">Brush</option>
-      <option value="pen">Pen</option>
-    </select>
-    <input type="range" min="0" max="1" step="0.1" v-model="opacity" />
-    <input type="checkbox" v-model="lockSegmentation" />
-    <select v-model="overwriteMode">
-      <option value="overwrite">Overwrite unlocked segments</option>
-      <option value="noOverwrite">Do not overwrite segments</option>
-    </select>
-    <input type="text" v-model="currentTaxonomy" placeholder="Taxonomy" />
-    <button @click="createNewSegment">New Segment</button>
-  </div>
-  <!-- Add transformer controls that appear when a shape is selected -->
-  <div v-if="selectedShape" class="shape-controls">
-    <button @click="toggleShapeLock">
-      {{ isShapeLocked(selectedShape) ? '🔒' : '🔓' }}
-    </button>
+  <div class="drawing-app">
+    <div id="container" class="canvas-container" @click="handleCanvasClick"></div>
+    
+    <!-- Main controls -->
+    <div class="controls">
+      <div class="control-group">
+        <label>Color</label>
+        <input type="color" v-model="brushColor" title="Select brush color" />
+      </div>
+      
+      <div class="control-group">
+        <label>Size: {{ borderSize }}</label>
+        <input 
+          type="range" 
+          min="1" 
+          max="50" 
+          v-model="borderSize" 
+          title="Adjust brush size"
+        />
+      </div>
+      
+      <button 
+        @click="toggleEraser"
+        :class="{ active: isErasing }"
+        class="tool-button"
+      >
+        {{ isErasing ? 'Draw' : 'Erase' }}
+      </button>
+      
+      <div class="control-group">
+        <label>Tool</label>
+        <select v-model="currentTool" class="tool-select">
+          <option value="brush">Brush</option>
+          <option value="pen">Pen</option>
+        </select>
+      </div>
+      
+      <div class="control-group">
+        <label>Opacity: {{ opacity }}</label>
+        <input 
+          type="range" 
+          min="0" 
+          max="1" 
+          step="0.1" 
+          v-model="opacity" 
+          title="Adjust opacity"
+        />
+      </div>
+    </div>
+
+    <!-- Element Management UI -->
+    <div class="element-management">
+      <div class="current-element">
+        <h3>Elements Management</h3>
+        <button 
+          @click="addNewElement" 
+          class="add-element-button"
+          title="Add new element"
+        >
+          + Add New Element
+        </button>
+      </div>
+
+      <div class="elements-list">
+        <h3>Elements ({{ elements.length }})</h3>
+        <div class="elements-container">
+          <div 
+            v-for="(element, index) in elements" 
+            :key="element.id"
+            :class="['element-item', { 
+              active: selectedElementIndex === index,
+              highlighted: highlightedElementIndex === index 
+            }]"
+            @click.stop="selectElement(index)"
+            @mouseover="highlightElement(index)"
+            @mouseleave="unhighlightElement()"
+          >
+            <div class="element-info">
+              <span class="element-name">Shape {{ index + 1 }}</span>
+            </div>
+            <div class="element-timestamp">
+              {{ formatTimestamp(element.timestamp) }}
+            </div>
+            <div class="element-actions">
+              <button 
+                @click.stop="toggleElementVisibility(index)"
+                class="visibility-button"
+                :class="{ hidden: !element.isVisible }"
+                title="Toggle visibility"
+              >
+                {{ element.isVisible ? '👁️' : '👁️‍🗨️' }}
+              </button>
+              <button 
+                v-if="selectedElementIndex === index"
+                @click.stop="toggleElementLock(index)"
+                class="lock-button"
+                :class="{ locked: element.shape?.isLocked }"
+                title="Toggle lock"
+              >
+                {{ element.shape?.isLocked ? '🔒' : '🔓' }}
+              </button>
+              <button 
+                v-if="selectedElementIndex === index"
+                @click.stop="deleteElement(index)"
+                class="delete-button"
+                title="Delete shape"
+              >
+                🗑️
+              </button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Toast Notifications -->
+    <div class="toast-container">
+      <transition-group name="toast">
+        <div 
+          v-for="toast in toasts" 
+          :key="toast.id"
+          class="toast"
+          :class="toast.type"
+        >
+          {{ toast.message }}
+        </div>
+      </transition-group>
+    </div>
   </div>
 </template>
 
@@ -31,210 +134,346 @@
 import { onMounted, ref, watch } from 'vue';
 import Konva from 'konva';
 
+// Interfaces
+interface ShapeState {
+  id: string;
+  type: 'line' | 'shape' | 'pen';
+  coordinates: number[];
+  isVisible: boolean;
+  isLocked: boolean;
+  color: string;
+  strokeWidth: number;
+  opacity: number;
+}
+
+interface Element {
+  id: string;
+  shape: ShapeState | null;
+  timestamp: number;
+  isVisible: boolean;
+}
+
+interface Toast {
+  id: number;
+  message: string;
+  type: 'success' | 'error' | 'info';
+}
+
+// Refs for canvas
 const stageRef = ref<Konva.Stage | null>(null);
-const layerRef = ref<Konva.Layer | null>(null);
-const isDrawing = ref(false);
-const brushColor = ref('#000000');
-const borderSize = ref(5);
-const imageRef = ref<Konva.Image | null>(null);
-const isErasing = ref(false);
+const mainLayer = ref<Konva.Layer | null>(null);
+const highlightLayer = ref<Konva.Layer | null>(null);
 const currentLine = ref<Konva.Line | null>(null);
 const lastPointerPosition = ref<Konva.Vector2d | null>(null);
 
-// New refs
+// Refs for drawing state
+const isDrawing = ref(false);
+const isErasing = ref(false);
+const brushColor = ref('#000000');
+const borderSize = ref(5);
 const currentTool = ref<'brush' | 'pen'>('brush');
 const opacity = ref(1);
-const lockSegmentation = ref(false);
-const overwriteMode = ref<'overwrite' | 'noOverwrite'>('overwrite');
-const currentTaxonomy = ref('');
-const segments = ref<Konva.Group[]>([]);
 const penPoints = ref<Konva.Vector2d[]>([]);
 
-// Add new refs
-const selectedShape = ref<Konva.Line | null>(null);
-const lockedShapes = ref<Set<Konva.Line>>(new Set());
-const transformer = ref<Konva.Transformer | null>(null);
+// Refs for element management
+const elements = ref<Element[]>([]);
+const selectedElementIndex = ref<number | null>(null);
+const highlightedElementIndex = ref<number | null>(null);
+const toasts = ref<Toast[]>([]);
+let toastCounter = 0;
 
+// Shapes container for easy access
+const shapeRefs = new Map<string, Konva.Shape>();
+
+// Initialization and setup
 onMounted(() => {
+  initializeStage();
+  loadSavedElements();
+});
+
+function initializeStage() {
   const stage = new Konva.Stage({
     container: 'container',
     width: 800,
     height: 600,
   });
-
   stageRef.value = stage;
 
   const layer = new Konva.Layer();
   stage.add(layer);
-  layerRef.value = layer;
+  mainLayer.value = layer;
 
-  setupEventListeners(stage, layer);
+  const hLayer = new Konva.Layer();
+  stage.add(hLayer);
+  highlightLayer.value = hLayer;
 
-  // Add transformer
-  const tr = new Konva.Transformer({
-    nodes: [],
-    visible: false,
-    rotateEnabled: false,
-    borderStroke: '#00ff00',
-    borderStrokeWidth: 2,
-  });
-  
-  layerRef.value?.add(tr);
-  transformer.value = tr;
-});
-
-function setupEventListeners(stage: Konva.Stage, layer: Konva.Layer) {
-  stage.on('mousedown touchstart', (e) => {
-    const pos = stage.getPointerPosition();
-    if (!pos) return;
-
-    if (currentTool.value === 'pen') {
-      // Add point to penPoints
-      penPoints.value.push(pos);
-
-      // Draw the point
-      drawPenPoint(layer, pos);
-
-      // Check if the new point closes the shape
-      if (penPoints.value.length > 2 && isCloseToStart(pos, penPoints.value[0])) {
-        closePenShape(layer);
-      } else {
-        // Draw a line segment to the new point
-        drawPenSegment(layer, pos);
-      }
-    } else {
-      isDrawing.value = true;
-      lastPointerPosition.value = pos;
-      if (isErasing.value) {
-        startErasing(pos, layer);
-      } else {
-        startDrawing(pos, layer);
-      }
-    }
-  });
-
-  stage.on('mousemove touchmove', () => {
-    if (!isDrawing.value) return;
-
-    const pos = stage.getPointerPosition();
-    if (pos && lastPointerPosition.value) {
-      if (isErasing.value) {
-        continueErasing(pos);
-      } else {
-        continueDrawing(lastPointerPosition.value, pos);
-      }
-      lastPointerPosition.value = pos;
-    }
-  });
-
-  stage.on('mouseup touchend', () => {
-    isDrawing.value = false;
-    currentLine.value = null;
-  });
-
-  stage.on('mouseenter', () => {
-    stage.container().style.cursor = currentTool.value === 'pen' ? 'crosshair' : 'default';
-  });
-
-  stage.on('mouseleave', () => {
-    stage.container().style.cursor = 'default';
-  });
-
-  // Add click handler to clear selection when clicking canvas
-  stage.on('click tap', () => {
-    if (stage.getPointerPosition()) {
-      selectedShape.value = null;
-      if (transformer.value) {
-        transformer.value.visible(false);
-      }
-      layer.batchDraw();
-    }
-  });
+  setupEventListeners(stage);
 }
 
-function startDrawing(pos: Konva.Vector2d, layer: Konva.Layer) {
+function setupEventListeners(stage: Konva.Stage) {
+  stage.on('mousedown touchstart', handlePointerStart);
+  stage.on('mousemove touchmove', handlePointerMove);
+  stage.on('mouseup touchend', handlePointerEnd);
+  stage.on('click tap', handleCanvasClick);
+}
+
+// Element Management
+function addNewElement() {
+  // Only add new element if current element has no shape
+  const currentElement = selectedElementIndex.value !== null ? 
+    elements.value[selectedElementIndex.value] : null;
+    
+  if (currentElement && !currentElement.shape) {
+    showToast('Complete current shape before adding new element', 'error');
+    return;
+  }
+
+  elements.value.push({
+    id: crypto.randomUUID(),
+    shape: null,
+    timestamp: Date.now(),
+    isVisible: true
+  });
+  
+  selectedElementIndex.value = elements.value.length - 1;
+  showToast('New element added', 'success');
+  saveElementsToStorage();
+}
+
+function selectElement(index: number) {
+  selectedElementIndex.value = selectedElementIndex.value === index ? null : index;
+  updateHighlights();
+}
+
+function highlightElement(index: number) {
+  if (highlightedElementIndex.value !== index) {
+    highlightedElementIndex.value = index;
+    updateHighlights();
+  }
+}
+
+function unhighlightElement() {
+  highlightedElementIndex.value = null;
+  updateHighlights();
+}
+
+function updateHighlights() {
+  if (!highlightLayer.value) return;
+
+  highlightLayer.value.destroyChildren();
+
+  elements.value.forEach((element, index) => {
+    if (!element.isVisible || !element.shape) return;
+
+    const isSelected = selectedElementIndex.value === index;
+    const isHighlighted = highlightedElementIndex.value === index;
+
+    if (isSelected || isHighlighted) {
+      const shape = shapeRefs.get(element.shape.id);
+      if (shape instanceof Konva.Line) {
+        const highlightShape = new Konva.Line({
+          points: element.shape.coordinates,
+          stroke: isSelected ? 'red' : '#2196F3',
+          strokeWidth: 2,
+          opacity: 0.5,
+          listening: false
+        });
+        highlightLayer.value?.add(highlightShape);
+      }
+    }
+  });
+
+  highlightLayer.value.batchDraw();
+}
+
+// Drawing Functions
+function startDrawing(pos: Konva.Vector2d) {
+  if (!mainLayer.value || selectedElementIndex.value === null) {
+    showToast('Select an element before drawing', 'error');
+    return;
+  }
+
+  const currentElement = elements.value[selectedElementIndex.value];
+  if (currentElement.shape) {
+    showToast('Element already has a shape', 'error');
+    return;
+  }
+
   const newLine = new Konva.Line({
     points: [pos.x, pos.y],
     stroke: brushColor.value,
     strokeWidth: borderSize.value,
     lineCap: 'round',
     lineJoin: 'round',
-    globalCompositeOperation: 'source-over',
     opacity: opacity.value,
   });
   
-  layer.add(newLine);
+  mainLayer.value.add(newLine);
   currentLine.value = newLine;
+  isDrawing.value = true;
 }
 
 function continueDrawing(lastPos: Konva.Vector2d, newPos: Konva.Vector2d) {
   if (!currentLine.value) return;
 
-  const newPoint = { x: newPos.x, y: newPos.y };
-
-  if (currentTool.value === 'brush') {
-    // Brush tool logic
-    const newPoints = currentLine.value.points().concat([newPoint.x, newPoint.y]);
-    currentLine.value.points(newPoints);
-    
-    // Check if shape should be closed and filled
-    if (newPoints.length >= 6 && 
-        Math.abs(newPoints[0] - newPoint.x) < 5 && 
-        Math.abs(newPoints[1] - newPoint.y) < 5) {
-      fillShape(currentLine.value);
-    }
-    
-  } else if (currentTool.value === 'pen') {
-    // Pen tool logic
-    penPoints.value.push(newPoint);
-    drawPenSegment(layer, newPos); // Call the existing function for pen drawing
-  }
-
-  layerRef.value?.batchDraw();
+  const points = currentLine.value.points().concat([newPos.x, newPos.y]);
+  currentLine.value.points(points);
+  mainLayer.value?.batchDraw();
 }
 
-function fillShape(line: Konva.Line) {
-  if (!layerRef.value) return;
+function createShapeFromLine(line: Konva.Line) {
+  if (!mainLayer.value || selectedElementIndex.value === null) return;
 
   const points = line.points();
+  const elementIndex = selectedElementIndex.value;
+  
+  // Create non-editable shape
   const shape = new Konva.Line({
-    points: points,
+    points,
     stroke: brushColor.value,
     strokeWidth: borderSize.value,
-    closed: true,
-    draggable: true,
-    globalCompositeOperation: 'source-over',
+    closed: false,
+    draggable: false,
     opacity: opacity.value,
   });
 
-  setupShapeEvents(shape);
-  layerRef.value.add(shape);
+  const shapeState: ShapeState = {
+    id: crypto.randomUUID(),
+    type: 'shape',
+    coordinates: points,
+    isVisible: true,
+    isLocked: true,
+    color: brushColor.value,
+    strokeWidth: borderSize.value,
+    opacity: opacity.value
+  };
+  
+  elements.value[elementIndex].shape = shapeState;
+  elements.value[elementIndex].timestamp = Date.now();
+  
+  shapeRefs.set(shapeState.id, shape);
+  
+  mainLayer.value.add(shape);
   line.destroy();
   currentLine.value = null;
+  
+  updateHighlights();
+  saveElementsToStorage();
+  showToast('Shape created', 'success');
 }
 
-function startErasing(pos: Konva.Vector2d, layer: Konva.Layer) {
-  const newEraserLine = new Konva.Line({
-    stroke: '#ffffff',
-    strokeWidth: borderSize.value * 2,
-    lineCap: 'round',
-    lineJoin: 'round',
-    points: [pos.x, pos.y],
-    globalCompositeOperation: 'source-over',
-    listening: true,
-  });
-  layer.add(newEraserLine);
-  currentLine.value = newEraserLine;
-}
-
-function continueErasing(pos: Konva.Vector2d) {
-  if (currentLine.value) {
-    const newPoints = currentLine.value.points().concat([pos.x, pos.y]);
-    currentLine.value.points(newPoints);
-    layerRef.value?.batchDraw();
+// Storage Functions
+function loadSavedElements() {
+  try {
+    const savedElements = localStorage.getItem('drawing-elements');
+    if (savedElements) {
+      elements.value = JSON.parse(savedElements);
+      elements.value.forEach(element => {
+        if (element.shape) {
+          createShapeFromState(element.shape);
+        }
+      });
+    }
+  } catch (error) {
+    console.error('Error loading elements:', error);
+    showToast('Error loading saved elements', 'error');
   }
 }
 
+function saveElementsToStorage() {
+  try {
+    localStorage.setItem('drawing-elements', JSON.stringify(elements.value));
+  } catch (error) {
+    console.error('Error saving elements:', error);
+    showToast('Error saving elements', 'error');
+  }
+}
+
+function createShapeFromState(shapeState: ShapeState) {
+  if (!mainLayer.value) return;
+
+  const shape = new Konva.Line({
+    points: shapeState.coordinates,
+    stroke: shapeState.color,
+    strokeWidth: shapeState.strokeWidth,
+    opacity: shapeState.opacity,
+    closed: false,
+    draggable: !shapeState.isLocked
+  });
+
+  shapeRefs.set(shapeState.id, shape);
+  mainLayer.value.add(shape);
+}
+
+// Event Handlers
+function handlePointerStart(e: Konva.KonvaEventObject<MouseEvent | TouchEvent>) {
+  const pos = stageRef.value?.getPointerPosition();
+  if (!pos) return;
+
+  if (isErasing.value) {
+    startErasing(pos);
+  } else if (currentTool.value === 'pen') {
+    handlePenStart(pos);
+  } else {
+    startDrawing(pos);
+  }
+}
+
+function handlePointerMove() {
+  const pos = stageRef.value?.getPointerPosition();
+  if (!pos || !isDrawing.value) return;
+
+  if (isErasing.value) {
+    continueErasing(pos);
+  } else if (lastPointerPosition.value) {
+    continueDrawing(lastPointerPosition.value, pos);
+  }
+  lastPointerPosition.value = pos;
+}
+
+function handlePointerEnd() {
+  if (!isDrawing.value) return;
+  
+  if (currentLine.value) {
+    createShapeFromLine(currentLine.value);
+  }
+  
+  isDrawing.value = false;
+  currentLine.value = null;
+  penPoints.value = [];
+  updateHighlights();
+}
+
+function handleCanvasClick(e: Konva.KonvaEventObject<MouseEvent>) {
+  if (e.target === stageRef.value) {
+    selectedElementIndex.value = null;
+    updateHighlights();
+  }
+}
+
+// Eraser Functions
+function startErasing(pos: Konva.Vector2d) {
+  isDrawing.value = true;
+  continueErasing(pos);
+}
+
+function continueErasing(pos: Konva.Vector2d) {
+  if (!mainLayer.value) return;
+
+  mainLayer.value.getAllIntersections(pos).forEach(shape => {
+    const shapeId = Array.from(shapeRefs.entries())
+      .find(([_, s]) => s === shape)?.[0];
+    
+    if (shapeId) {
+      const elementIndex = elements.value.findIndex(el => el.shape?.id === shapeId);
+      if (elementIndex !== -1) {
+        deleteElement(elementIndex);
+      }
+    }
+  });
+}
+
+// Utility Functions
 function toggleEraser() {
   isErasing.value = !isErasing.value;
   if (stageRef.value) {
@@ -242,212 +481,462 @@ function toggleEraser() {
   }
 }
 
-function loadImage(event: Event) {
-  const input = event.target as HTMLInputElement;
-  const file = input.files ? input.files[0] : null;
-  if (!file) return;
+function deleteElement(index: number) {
+  const elementToDelete = elements.value[index];
+  
+  if (elementToDelete.shape) {
+    const shape = shapeRefs.get(elementToDelete.shape.id);
+    if (shape) {
+      shape.destroy();
+      shapeRefs.delete(elementToDelete.shape.id);
+    }
+  }
 
-  const reader = new FileReader();
-  reader.onload = (e) => {
-    const imageObj = new Image();
-    imageObj.onload = () => {
-      const stage = stageRef.value;
-      if (stage) {
-        stage.width(imageObj.width);
-        stage.height(imageObj.height);
-      }
+  elements.value.splice(index, 1);
+  selectedElementIndex.value = null;
+  
+  mainLayer.value?.batchDraw();
+  updateHighlights();
+  saveElementsToStorage();
+  
+  showToast('Element deleted', 'success');
+}
 
-      const konvaImage = new Konva.Image({
-        x: 0,
-        y: 0,
-        image: imageObj,
-        width: imageObj.width,
-        height: imageObj.height,
-      });
-      
-      if (layerRef.value) {
-        layerRef.value.destroyChildren();
-        layerRef.value.add(konvaImage);
-        imageRef.value = konvaImage;
-        layerRef.value.batchDraw();
-      }
-    };
-    imageObj.src = e.target?.result as string;
+function toggleElementVisibility(index: number) {
+  const element = elements.value[index];
+  element.isVisible = !element.isVisible;
+
+  if (element.shape) {
+    const shape = shapeRefs.get(element.shape.id);
+    if (shape) {
+      shape.visible(element.isVisible);
+    }
+  }
+
+  mainLayer.value?.batchDraw();
+  updateHighlights();
+  saveElementsToStorage();
+}
+
+function formatTimestamp(timestamp: number): string {
+  return new Date(timestamp).toLocaleString();
+}
+
+function showToast(message: string, type: 'success' | 'error' | 'info' = 'info') {
+  const toast: Toast = {
+    id: toastCounter++,
+    message,
+    type
   };
-  reader.readAsDataURL(file);
+  
+  toasts.value.push(toast);
+  setTimeout(() => {
+    const index = toasts.value.findIndex(t => t.id === toast.id);
+    if (index !== -1) {
+      toasts.value.splice(index, 1);
+    }
+  }, 3000);
 }
 
-function endDrawing() {
-  if (currentTool.value === 'pen' && penPoints.value.length > 2) {
-    const shape = new Konva.Line({
-      points: penPoints.value.flatMap(p => [p.x, p.y]),
-      fill: brushColor.value,
-      stroke: brushColor.value,
-      strokeWidth: borderSize.value,
-      opacity: opacity.value,
-      closed: true,
-    });
-    layerRef.value?.add(shape);
-    currentLine.value?.destroy();
-    currentLine.value = null;
-    penPoints.value = [];
+// Pen Tool Functions
+function handlePenStart(pos: Konva.Vector2d) {
+  if (selectedElementIndex.value === null) {
+    showToast('Select an element before drawing', 'error');
+    return;
   }
-}
 
-function createNewSegment() {
-  const group = new Konva.Group({
-    name: currentTaxonomy.value,
-    draggable: !lockSegmentation.value,
-  });
-  layerRef.value?.add(group);
-  segments.value.push(group);
-}
-
-// Watch for changes in brushColor and borderSize
-watch([brushColor, borderSize, opacity], () => {
-  if (stageRef.value) {
-    stageRef.value.container().style.cursor = 'crosshair';
+  const currentElement = elements.value[selectedElementIndex.value];
+  if (currentElement.shape) {
+    showToast('Element already has a shape', 'error');
+    return;
   }
-});
 
-// New watch for lockSegmentation
-watch(lockSegmentation, (newValue) => {
-  segments.value.forEach(segment => {
-    segment.draggable(!newValue);
-  });
-});
-
-function drawPenSegment(layer: Konva.Layer, pos: Konva.Vector2d) {
-  if (currentLine.value) {
-    // Update existing line
-    const newPoints = currentLine.value.points().concat([pos.x, pos.y]);
-    currentLine.value.points(newPoints);
+  penPoints.value.push(pos);
+  drawPenPoint(pos);
+  
+  if (penPoints.value.length > 2 && isCloseToStart(pos)) {
+    completePenShape();
   } else {
-    // Create new line
-    const newLine = new Konva.Line({
-      points: penPoints.value.flatMap(p => [p.x, p.y]),
-      stroke: brushColor.value,
-      strokeWidth: borderSize.value,
-      lineCap: 'round',
-      lineJoin: 'round',
-    });
-    layer.add(newLine);
-    currentLine.value = newLine;
+    updatePenLine();
   }
-  layer.batchDraw();
 }
 
-function drawPenPoint(layer: Konva.Layer, pos: Konva.Vector2d) {
+function drawPenPoint(pos: Konva.Vector2d) {
+  if (!mainLayer.value) return;
+  
   const point = new Konva.Circle({
     x: pos.x,
     y: pos.y,
     radius: borderSize.value / 2,
     fill: brushColor.value,
   });
-  layer.add(point);
-  layer.batchDraw();
+  mainLayer.value.add(point);
+  mainLayer.value.batchDraw();
 }
 
-function isCloseToStart(pos: Konva.Vector2d, start: Konva.Vector2d): boolean {
-  const distance = Math.sqrt(Math.pow(pos.x - start.x, 2) + Math.pow(pos.y - start.y, 2));
-  return distance < 10; // Adjust the threshold as needed
+function updatePenLine() {
+  if (!mainLayer.value) return;
+  
+  if (currentLine.value) {
+    currentLine.value.points(penPoints.value.flatMap(p => [p.x, p.y]));
+  } else {
+    currentLine.value = new Konva.Line({
+      points: penPoints.value.flatMap(p => [p.x, p.y]),
+      stroke: brushColor.value,
+      strokeWidth: borderSize.value,
+      lineCap: 'round',
+      lineJoin: 'round',
+    });
+    mainLayer.value.add(currentLine.value);
+  }
+  mainLayer.value.batchDraw();
 }
 
-function closePenShape(layer: Konva.Layer) {
+function completePenShape() {
+  if (!mainLayer.value || selectedElementIndex.value === null) return;
+
+  const elementIndex = selectedElementIndex.value;
+  const shapeId = crypto.randomUUID();
+  
+  // Create non-editable pen shape
   const shape = new Konva.Line({
     points: penPoints.value.flatMap(p => [p.x, p.y]),
     fill: brushColor.value,
     stroke: brushColor.value,
     strokeWidth: borderSize.value,
     closed: true,
+    draggable: false,
+    opacity: opacity.value,
   });
-  layer.add(shape);
+
+  const shapeState: ShapeState = {
+    id: shapeId,
+    type: 'pen',
+    coordinates: penPoints.value.flatMap(p => [p.x, p.y]),
+    isVisible: true,
+    isLocked: false,
+    color: brushColor.value,
+    strokeWidth: borderSize.value,
+    opacity: opacity.value
+  };
+  
+  elements.value[elementIndex].shape = shapeState;
+  elements.value[elementIndex].timestamp = Date.now();
+  
+  shapeRefs.set(shapeId, shape);
+  
+  mainLayer.value.add(shape);
   currentLine.value?.destroy();
   currentLine.value = null;
   penPoints.value = [];
-  layer.batchDraw();
+  
+  updateHighlights();
+  saveElementsToStorage();
+  showToast('Pen shape created', 'success');
 }
 
-// Add new functions for shape selection and locking
-function setupShapeEvents(shape: Konva.Line) {
-  shape.on('click tap', () => {
-    if (isShapeLocked(shape)) return;
-    
-    selectedShape.value = shape;
-    if (transformer.value) {
-      transformer.value.nodes([shape]);
-      transformer.value.visible(true);
-    }
-    layerRef.value?.batchDraw();
-  });
-
-  shape.on('mouseenter', () => {
-    if (!isShapeLocked(shape)) {
-      document.body.style.cursor = 'pointer';
-    }
-  });
-
-  shape.on('mouseleave', () => {
-    document.body.style.cursor = 'default';
-  });
+function isCloseToStart(pos: Konva.Vector2d): boolean {
+  if (penPoints.value.length < 3) return false;
+  const start = penPoints.value[0];
+  const distance = Math.sqrt(
+    Math.pow(pos.x - start.x, 2) + Math.pow(pos.y - start.y, 2)
+  );
+  return distance < 10;
 }
 
-function isShapeLocked(shape: Konva.Line): boolean {
-  return lockedShapes.value.has(shape);
-}
+// Watch for selection changes
+watch(selectedElementIndex, (newIndex, oldIndex) => {
+  updateHighlights();
+});
 
-function toggleShapeLock() {
-  if (!selectedShape.value) return;
-
-  if (isShapeLocked(selectedShape.value)) {
-    lockedShapes.value.delete(selectedShape.value);
-    selectedShape.value.draggable(true);
-  } else {
-    lockedShapes.value.add(selectedShape.value);
-    selectedShape.value.draggable(false);
-    if (transformer.value) {
-      transformer.value.visible(false);
-    }
-    selectedShape.value = null;
+function toggleElementLock(index: number) {
+  const element = elements.value[index];
+  if (!element.shape) return;
+  
+  element.shape.isLocked = !element.shape.isLocked;
+  
+  // Update the shape's draggable state
+  const shape = shapeRefs.get(element.shape.id);
+  if (shape) {
+    shape.draggable(!element.shape.isLocked);
   }
-  layerRef.value?.batchDraw();
+  
+  saveElementsToStorage();
+  showToast(
+    element.shape.isLocked ? 'Shape locked' : 'Shape unlocked',
+    'info'
+  );
 }
-
 </script>
 
 <style scoped>
-#container {
-  background-color: #ffffff; 
-  border: 1px solid #ccc; 
+.drawing-app {
+  display: grid;
+  grid-template-columns: 1fr 300px;
+  gap: 20px;
+  padding: 20px;
+  height: 100vh;
+  background-color: #f5f5f5;
 }
+
+.canvas-container {
+  grid-column: 1;
+  background-color: white;
+  border: 1px solid #ddd;
+  border-radius: 8px;
+  box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
+  overflow: hidden;
+  position: relative;
+}
+
 .controls {
-  position: absolute;
-  top: 10px;
-  left: 10px;
+  position: fixed;
+  top: 20px;
+  left: 20px;
+  z-index: 100;
   display: flex;
-  gap: 10px;
-}
-/* Add new styles */
-.shape-controls {
-  position: absolute;
+  flex-wrap: wrap;
+  gap: 12px;
   background: white;
-  padding: 5px;
-  border-radius: 4px;
-  box-shadow: 0 2px 4px rgba(0,0,0,0.2);
-  z-index: 1000;
+  padding: 12px;
+  border-radius: 8px;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.15);
 }
 
-.shape-controls button {
-  padding: 4px 8px;
+.control-group {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.control-group label {
+  font-size: 12px;
+  color: #666;
+  font-weight: 500;
+}
+
+input[type="color"] {
+  width: 40px;
+  height: 40px;
+  padding: 0;
+  border: none;
+  border-radius: 4px;
   cursor: pointer;
-  font-size: 1.2em;
-  background: none;
-  border: 1px solid #ccc;
-  border-radius: 4px;
 }
 
-.shape-controls button:hover {
+input[type="range"] {
+  width: 100px;
+  cursor: pointer;
+}
+
+.tool-button {
+  padding: 8px 16px;
   background: #f0f0f0;
+  border: 1px solid #ddd;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 14px;
+  transition: all 0.2s ease;
+}
+
+.tool-button:hover {
+  background: #e0e0e0;
+}
+
+.tool-button.active {
+  background: #2196F3;
+  color: white;
+  border-color: #1976D2;
+}
+
+.tool-select {
+  padding: 6px;
+  border: 1px solid #ddd;
+  border-radius: 4px;
+  background: white;
+  cursor: pointer;
+}
+
+.element-management {
+  grid-column: 2;
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+  height: 100%;
+}
+
+.current-element {
+  background: white;
+  padding: 16px;
+  border-radius: 8px;
+  box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
+}
+
+.current-element h3 {
+  margin: 0 0 12px 0;
+  color: #333;
+  font-size: 16px;
+  font-weight: 600;
+}
+
+.add-element-button {
+  width: 100%;
+  padding: 12px;
+  background: #4CAF50;
+  color: white;
+  border: none;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 14px;
+  font-weight: 500;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  transition: all 0.2s ease;
+}
+
+.add-element-button:hover {
+  background: #43A047;
+}
+
+.elements-list {
+  background: white;
+  padding: 16px;
+  border-radius: 8px;
+  box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
+  flex-grow: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  overflow: hidden;
+}
+
+.elements-container {
+  overflow-y: auto;
+  flex-grow: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.element-item {
+  padding: 12px;
+  background: #f8f8f8;
+  border: 2px solid transparent;
+  border-radius: 6px;
+  cursor: pointer;
+  transition: all 0.2s ease;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.element-item.active {
+  background: #e3f2fd;
+  border-color: #2196F3;
+}
+
+.element-item.highlighted {
+  background: #fff3e0;
+  border-color: #ff9800;
+}
+
+.element-info {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.element-name {
+  font-weight: 500;
+  color: #333;
+}
+
+.element-timestamp {
+  font-size: 11px;
+  color: #888;
+}
+
+.visibility-button, .delete-button, .lock-button {
+  background: none;
+  border: none;
+  cursor: pointer;
+  padding: 4px;
+  font-size: 16px;
+  opacity: 0.7;
+  transition: all 0.2s ease;
+}
+
+.visibility-button:hover, .delete-button:hover, .lock-button:hover {
+  opacity: 1;
+  transform: scale(1.1);
+}
+
+.lock-button.locked {
+  color: #2196F3;
+  opacity: 1;
+}
+
+.element-actions {
+  display: flex;
+  gap: 4px;
+  align-items: center;
+}
+
+.toast-container {
+  position: fixed;
+  top: 20px;
+  right: 20px;
+  z-index: 1000;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.toast {
+  min-width: 250px;
+  padding: 12px 16px;
+  border-radius: 6px;
+  color: white;
+  font-size: 14px;
+  font-weight: 500;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.2);
+}
+
+.toast.success {
+  background: #4CAF50;
+}
+
+.toast.error {
+  background: #F44336;
+}
+
+.toast.info {
+  background: #2196F3;
+}
+
+@media (max-width: 1200px) {
+  .drawing-app {
+    grid-template-columns: 1fr 250px;
+  }
+}
+
+@media (max-width: 768px) {
+  .drawing-app {
+    grid-template-columns: 1fr;
+    grid-template-rows: 1fr auto;
+  }
+
+  .element-management {
+    grid-row: 2;
+    grid-column: 1;
+    max-height: 300px;
+  }
+
+  .controls {
+    position: static;
+    margin-bottom: 12px;
+  }
 }
 </style>
-
