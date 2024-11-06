@@ -1189,14 +1189,152 @@ function findIntersectionsWithSelected() {
 }
 // end of intersection logic
 // locked area  erasing logic
-function eraseLockedAreas() {
-  console.log('Starting locked area erasing process');
-  if (!mainLayer.value) {
-    console.log('No main layer found, aborting');
-    return;
+async function generateBorderPath(startPoint: Point, endPoint: Point, borderPoints: number[], offset: number): Promise<Point[]> {
+  console.log('=== Starting Border Path Generation ===');
+  console.log('Start Point:', startPoint);
+  console.log('End Point:', endPoint);
+
+  const len = borderPoints.length;
+  let startIdx = -1;
+  let endIdx = -1;
+  let minStartDist = Infinity;
+  let minEndDist = Infinity;
+
+  // Find closest border points
+  for (let i = 0; i < len; i += 2) {
+    const borderX = borderPoints[i];
+    const borderY = borderPoints[i + 1];
+    
+    const startDist = Math.sqrt(
+      Math.pow(startPoint.x - borderX, 2) + 
+      Math.pow(startPoint.y - borderY, 2)
+    );
+    const endDist = Math.sqrt(
+      Math.pow(endPoint.x - borderX, 2) + 
+      Math.pow(endPoint.y - borderY, 2)
+    );
+
+    if (startDist < minStartDist) {
+      minStartDist = startDist;
+      startIdx = i;
+      console.log('New closest start point:', { x: borderX, y: borderY, distance: startDist });
+    }
+    if (endDist < minEndDist) {
+      minEndDist = endDist;
+      endIdx = i;
+      console.log('New closest end point:', { x: borderX, y: borderY, distance: endDist });
+    }
   }
 
-  // Get all locked shapes
+  // Calculate path lengths
+  console.log('Calculating path lengths...');
+  let clockwisePoints: Point[] = [];
+  let counterPoints: Point[] = [];
+  let idx = startIdx;
+
+  // Clockwise collection
+  while (idx !== endIdx) {
+    const p1 = { x: borderPoints[idx], y: borderPoints[idx + 1] };
+    clockwisePoints.push(p1);
+    idx = (idx + 2) % len;
+  }
+  clockwisePoints.push({ x: borderPoints[endIdx], y: borderPoints[endIdx + 1] });
+
+  // Counter-clockwise collection
+  idx = startIdx;
+  while (idx !== endIdx) {
+    const p1 = { x: borderPoints[idx], y: borderPoints[idx + 1] };
+    counterPoints.push(p1);
+    idx = (idx - 2 + len) % len;
+  }
+  counterPoints.push({ x: borderPoints[endIdx], y: borderPoints[endIdx + 1] });
+
+  const clockwiseLen = calculatePathLength(clockwisePoints);
+  const counterLen = calculatePathLength(counterPoints);
+  
+  console.log('Path lengths:', {
+    clockwise: clockwiseLen,
+    counterclockwise: counterLen
+  });
+
+  // Choose shorter path
+  const finalPoints = clockwiseLen <= counterLen ? clockwisePoints : counterPoints;
+  console.log(`Chose ${clockwiseLen <= counterLen ? 'clockwise' : 'counter-clockwise'} path`);
+
+  // Generate offset points with visualization delay
+  const offsetPoints: Point[] = [];
+  const debugLayer = new Konva.Layer();
+  mainLayer.value?.getStage()?.add(debugLayer);
+
+  for (let i = 0; i < finalPoints.length - 1; i++) {
+    const p1 = finalPoints[i];
+    const p2 = finalPoints[i + 1];
+    
+    // Calculate normal
+    const dx = p2.x - p1.x;
+    const dy = p2.y - p1.y;
+    const len = Math.sqrt(dx * dx + dy * dy);
+    const normalX = -dy / len;
+    const normalY = dx / len;
+
+    // Calculate offset point
+    const offsetPoint = {
+      x: p1.x + normalX * offset,
+      y: p1.y + normalY * offset
+    };
+    offsetPoints.push(offsetPoint);
+
+    // Visualize current point
+    const point = new Konva.Circle({
+      x: offsetPoint.x,
+      y: offsetPoint.y,
+      radius: 2,
+      fill: 'blue',
+      opacity: 0.5
+    });
+    debugLayer.add(point);
+    debugLayer.draw();
+
+    console.log('Generated offset point:', {
+      original: p1,
+      offset: offsetPoint,
+      normal: { x: normalX, y: normalY }
+    });
+
+    // Add delay for visualization
+    await new Promise(resolve => setTimeout(resolve, 1000));
+  }
+
+  // Add final point
+  offsetPoints.push({
+    x: endPoint.x,
+    y: endPoint.y
+  });
+
+  // Clean up debug visualization after delay
+  setTimeout(() => {
+    debugLayer.destroy();
+  }, 2000);
+
+  return offsetPoints;
+}
+
+function calculatePathLength(points: Point[]): number {
+  let length = 0;
+  for (let i = 0; i < points.length - 1; i++) {
+    const p1 = points[i];
+    const p2 = points[i + 1];
+    length += Math.sqrt(
+      Math.pow(p2.x - p1.x, 2) + Math.pow(p2.y - p1.y, 2)
+    );
+  }
+  return length;
+}
+
+async function eraseLockedAreas() {
+  console.log('=== Starting Locked Area Erasing ===');
+  if (!mainLayer.value) return;
+
   const lockedShapes = shapeLockStates.value
     .filter(state => state.isLocked)
     .map(state => ({
@@ -1205,136 +1343,126 @@ function eraseLockedAreas() {
     }))
     .filter(item => item.shape !== undefined);
 
-  console.log(`Found ${lockedShapes.length} locked shapes`);
+  console.log('Found locked shapes:', lockedShapes);
 
   if (lockedShapes.length === 0) {
     showToast('No locked shapes found', 'info');
     return;
   }
 
-  // Process each shape on the layer
   const shapes = mainLayer.value.children?.filter(
     child => child instanceof Konva.Line && child.visible()
   ) as Konva.Line[] || [];
 
-  console.log(`Processing ${shapes.length} visible lines`);
-  let totalPointsErased = 0;
-  let shapesModified = 0;
-  let shapesRemoved = 0;
-
-  shapes.forEach(shape => {
-    // Skip if this shape is locked
+  for (const shape of shapes) {
     const shapeId = shape.id();
-    const isLocked = shapeLockStates.value.some(state => 
-      state.isLocked && state.id === shapeId
-    );
-    
-    if (isLocked) {
+    if (shapeLockStates.value.some(state => state.isLocked && state.id === shapeId)) {
       console.log(`Skipping locked shape ${shapeId}`);
-      return;
+      continue;
     }
 
+    console.log(`Processing shape ${shapeId}`);
     const points = shape.points();
-    let modified = false;
-    let newSegments: number[][] = [[]];
-    let currentSegment = 0;
-    
-    console.log(`Processing unlocked shape ${shapeId} with ${points.length / 2} points`);
-    
-    // First pass: collect points into segments
+    const segments: number[][] = [];
+    let currentSegment: number[] = [];
+    let isInside = false;
+
+    // First, split into segments based on intersection
     for (let i = 0; i < points.length; i += 2) {
-      const pointX = points[i];
-      const pointY = points[i + 1];
-      const currentPoint = { x: pointX, y: pointY };
-      
-      let isPointInLocked = false;
+      const point = { x: points[i], y: points[i + 1] };
+      const wasInside = isInside;
+      isInside = false;
+
       for (const lockedItem of lockedShapes) {
-        if (lockedItem.shape && isPointInShape(currentPoint, lockedItem.shape.coordinates)) {
-          isPointInLocked = true;
-          modified = true;
-          totalPointsErased++;
+        if (lockedItem.shape && isPointInShape(point, lockedItem.shape.coordinates)) {
+          isInside = true;
           break;
         }
       }
 
-      if (!isPointInLocked) {
-        // Add point to current segment
-        newSegments[currentSegment].push(pointX, pointY);
-      } else {
-        // If we have points in the current segment and the next point is also outside,
-        // we'll keep the current segment and start a new one
-        if (newSegments[currentSegment].length > 0) {
-          currentSegment++;
-          newSegments[currentSegment] = [];
-        }
+      if (!isInside) {
+        // Point is outside - add to current segment
+        currentSegment.push(point.x, point.y);
+      } else if (!wasInside && currentSegment.length > 0) {
+        // Just entered locked area - finish current segment
+        segments.push([...currentSegment]);
+        currentSegment = [];
       }
-    }
-    
-    if (modified) {
-      shapesModified++;
-      
-      // Filter valid segments (more than 2 points to form a line)
-      const validSegments = newSegments.filter(seg => seg.length >= 4);
-      
-      if (validSegments.length === 0) {
-        console.log(`Removing shape ${shapeId} - no valid segments remain`);
-        const elementIndex = elements.value.findIndex(el => el.shape?.id === shapeId);
-        if (elementIndex !== -1) {
-          elements.value.splice(elementIndex, 1);
-        }
-        shape.destroy();
-        shapeRefs.delete(shapeId);
-        shapesRemoved++;
-      } else {
-        // Combine all valid segments with small gaps between them
-        const combinedPoints: number[] = [];
-        validSegments.forEach((segment, index) => {
-          if (index > 0) {
-            // Add a small move between segments to create a visual break
-            const lastX = combinedPoints[combinedPoints.length - 2];
-            const lastY = combinedPoints[combinedPoints.length - 1];
-            const nextX = segment[0];
-            const nextY = segment[1];
-            
-            // Add the segment with its points
-            combinedPoints.push(...segment);
-          } else {
-            combinedPoints.push(...segment);
-          }
-        });
-        
-        console.log(`Updating shape ${shapeId} with ${combinedPoints.length / 2} total points from ${validSegments.length} segments`);
-        shape.points(combinedPoints);
-        
-        // Update data structures
-        const elementIndex = elements.value.findIndex(el => el.shape?.id === shapeId);
-        if (elementIndex !== -1) {
-          elements.value[elementIndex].shape!.coordinates = combinedPoints;
-        }
-      }
-    }
-  });
 
-  console.log('Erasing process completed:');
-  console.log(`- Total points erased: ${totalPointsErased}`);
-  console.log(`- Shapes modified: ${shapesModified}`);
-  console.log(`- Shapes removed: ${shapesRemoved}`);
+      // If we just exited the locked area, start a new segment
+      if (wasInside && !isInside) {
+        currentSegment = [point.x, point.y];
+      }
+    }
+
+    // Add final segment if it exists
+    if (currentSegment.length > 0) {
+      segments.push(currentSegment);
+    }
+
+    // Now process segments and add connecting paths
+    if (segments.length >= 2) {
+      const finalPoints: number[] = [];
+      
+      for (let i = 0; i < segments.length; i++) {
+        const currentSegment = segments[i];
+        
+        // Add current segment points
+        finalPoints.push(...currentSegment);
+
+        // If there's a next segment, we need to connect to it
+        if (i < segments.length - 1) {
+          const nextSegment = segments[i + 1];
+          
+          const startPoint = {
+            x: currentSegment[currentSegment.length - 2],
+            y: currentSegment[currentSegment.length - 1]
+          };
+          
+          const endPoint = {
+            x: nextSegment[0],
+            y: nextSegment[1]
+          };
+
+          console.log(`Connecting segments from (${startPoint.x}, ${startPoint.y}) to (${endPoint.x}, ${endPoint.y})`);
+          
+          // Generate connecting path
+          const borderPath = await generateBorderPath(
+            startPoint,
+            endPoint,
+            lockedShapes[0].shape!.coordinates,
+            5
+          );
+
+          // Only add the path points (don't duplicate intersection points)
+          for (let j = 1; j < borderPath.length - 1; j++) {
+            finalPoints.push(borderPath[j].x, borderPath[j].y);
+          }
+        }
+      }
+
+      // Update shape with final points
+      console.log(`Updating shape with ${finalPoints.length / 2} points`);
+      shape.points(finalPoints);
+      
+      const elementIndex = elements.value.findIndex(el => el.shape?.id === shapeId);
+      if (elementIndex !== -1) {
+        elements.value[elementIndex].shape!.coordinates = finalPoints;
+      }
+    }
+  }
 
   mainLayer.value.batchDraw();
   saveElementsToStorage();
 }
 
-function toggleLockedAreaEraser() {
+async function toggleLockedAreaEraser() {
   isLockedAreaErasing.value = !isLockedAreaErasing.value;
-  isErasing.value = false; // Disable regular eraser
+  isErasing.value = false;
   
   if (isLockedAreaErasing.value) {
     console.log('Locked area eraser activated - performing immediate erase');
-    eraseLockedAreas();
-  }
-  
-  if (stageRef.value) {
-    stageRef.value.container().style.cursor = 'default';
+    await eraseLockedAreas();
   }
 }
 
