@@ -27,7 +27,22 @@
       >
         {{ isErasing ? 'Draw' : 'Erase' }}
       </button>
-      
+      <button 
+    v-if="selectedElementIndex !== null"
+    @click="findIntersectionsWithSelected"
+    class="tool-button"
+    title="Find intersections"
+  >
+    Find Intersections
+  </button>
+  <button 
+      @click="toggleLockedAreaEraser"
+      :class="{ active: isLockedAreaErasing }"
+      class="tool-button"
+      title="Erase points in locked areas"
+    >
+      Locked Area Eraser
+    </button>
       <div class="control-group">
         <label>Tool</label>
         <select v-model="currentTool" class="tool-select">
@@ -73,8 +88,14 @@
               highlighted: highlightedElementIndex === index 
             }]"
             @click.stop="selectElement(index)"
-            @mouseover="highlightElement(index)"
-            @mouseleave="unhighlightElement()"
+            @mouseover="() => {
+      highlightElement(index);
+      if (element.shape?.id) highlightShapeArea(element.shape.id);
+    }"
+    @mouseleave="() => {
+      unhighlightElement();
+      clearAreaHighlights();
+    }"
           >
             <div class="element-info">
               <span class="element-name">Shape {{ index + 1 }}</span>
@@ -145,6 +166,7 @@ interface ShapeState {
   strokeWidth: number;
   opacity: number;
   clipPath?: number[];
+  area?: number;
 }
 
 interface Element {
@@ -158,6 +180,22 @@ interface Toast {
   id: number;
   message: string;
   type: 'success' | 'error' | 'info';
+}
+interface ShapeLockState {
+  id: string;
+  isLocked: boolean;
+}
+interface Point {
+  x: number;
+  y: number;
+}
+
+interface Intersection {
+  points: Point[];
+}
+
+interface IntersectionResult {
+  [key: string]: Intersection;
 }
 
 // Refs for canvas
@@ -188,6 +226,9 @@ const shapeRefs = new Map<string, Konva.Shape>();
 
 // Add to the refs section near the top of the script
 const shapeLayers = ref(new Map<string, Konva.Layer>());
+const shapeLockStates = ref<ShapeLockState[]>([]);
+const areaHighlightLayer = ref<Konva.Layer | null>(null);
+const isLockedAreaErasing = ref(false);
 
 // Initialization and setup
 onMounted(() => {
@@ -195,11 +236,25 @@ onMounted(() => {
   loadSavedElements();
 });
 
+// Utility Functions
+// Add new function to track lock states
+function updateShapeLockStates() {
+  shapeLockStates.value = elements.value
+    .filter(element => element.shape !== null)
+    .map(element => ({
+      id: element.shape!.id,
+      isLocked: element.shape!.isLocked
+    }));
+}
+
+
 function initializeStage() {
+  const container = document.getElementById('container');
+  if (!container) return;
   const stage = new Konva.Stage({
     container: 'container',
-    width: 800,
-    height: 600,
+    width: container.offsetWidth,
+    height: container.offsetHeight,
   });
   stageRef.value = stage;
 
@@ -210,6 +265,12 @@ function initializeStage() {
   const hLayer = new Konva.Layer();
   stage.add(hLayer);
   highlightLayer.value = hLayer;
+
+  // Add area highlight layer
+  const areaLayer = new Konva.Layer();
+  stage.add(areaLayer);
+  areaHighlightLayer.value = areaLayer;
+
 
   setupEventListeners(stage);
 }
@@ -325,46 +386,6 @@ function continueDrawing(lastPos: Konva.Vector2d, newPos: Konva.Vector2d) {
   mainLayer.value?.batchDraw();
 }
 
-function createShapeFromLine1(line: Konva.Line) {
-  if (!mainLayer.value || selectedElementIndex.value === null) return;
-
-  const points = line.points();
-  const elementIndex = selectedElementIndex.value;
-  
-  // Create non-editable shape
-  const shape = new Konva.Line({
-    points,
-    stroke: brushColor.value,
-    strokeWidth: borderSize.value,
-    closed: false,
-    draggable: false,
-    opacity: opacity.value,
-  });
-
-  const shapeState: ShapeState = {
-    id: crypto.randomUUID(),
-    type: 'shape',
-    coordinates: points,
-    isVisible: true,
-    isLocked: true,
-    color: brushColor.value,
-    strokeWidth: borderSize.value,
-    opacity: opacity.value
-  };
-  
-  elements.value[elementIndex].shape = shapeState;
-  elements.value[elementIndex].timestamp = Date.now();
-  
-  shapeRefs.set(shapeState.id, shape);
-  
-  mainLayer.value.add(shape);
-  line.destroy();
-  currentLine.value = null;
-  
-  updateHighlights();
-  saveElementsToStorage();
-  showToast('Shape created', 'success');
-}
 
 // Storage Functions
 function loadSavedElements() {
@@ -377,6 +398,7 @@ function loadSavedElements() {
           createShapeFromState(element.shape);
         }
       });
+      updateShapeLockStates();
     }
   } catch (error) {
     console.error('Error loading elements:', error);
@@ -472,35 +494,217 @@ function handleCanvasClick(e: Konva.KonvaEventObject<MouseEvent>) {
 }
 
 // Eraser Functions
+// Enhanced eraser functions with comprehensive logging and improvements
+
 function startErasing(pos: Konva.Vector2d) {
+ 
   isDrawing.value = true;
   continueErasing(pos);
 }
 
 function continueErasing(pos: Konva.Vector2d) {
-  if (!mainLayer.value) return;
+  if (!mainLayer.value) {
+    return;
+  }
 
-  mainLayer.value.getAllIntersections(pos).forEach(shape => {
-    const shapeId = Array.from(shapeRefs.entries())
-      .find(([_, s]) => s === shape)?.[0];
-    
-    if (shapeId) {
-      const elementIndex = elements.value.findIndex(el => el.shape?.id === shapeId);
-      if (elementIndex !== -1) {
-        deleteElement(elementIndex);
+  const eraserRadius = borderSize.value ;
+
+  // Find shapes to modify
+  const shapes = mainLayer.value.children?.filter(
+    child => child instanceof Konva.Line && child.visible()
+  ) as Konva.Line[] || [];
+  shapes.forEach((shape, shapeIndex) => {
+    const originalPoints = [...shape.points()];
+    let segments: number[][] = [[]];
+    let currentSegment = 0;
+    let modified = false;
+    let removedPoints = 0;
+    // Process points and create segments
+    for (let i = 0; i < originalPoints.length; i += 2) {
+      const x = originalPoints[i];
+      const y = originalPoints[i + 1];
+      
+      const distance = Math.sqrt(
+        Math.pow(pos.x - x, 2) + Math.pow(pos.y - y, 2)
+      );
+
+      if (distance >= eraserRadius) {
+        // Point is outside eraser radius - keep it
+        segments[currentSegment].push(x, y);
+      } else {
+        // Point is within eraser radius - mark for removal
+        modified = true;
+        removedPoints++;
+
+        // Start new segment if we have points in current segment
+        if (segments[currentSegment].length > 0) {
+          currentSegment++;
+          segments[currentSegment] = [];
+        }
       }
     }
+
+    // Filter out empty segments and segments that are too small
+    const validSegments = segments.filter(seg => seg.length >= 4);
+    if (modified) {
+      const shapeId = shape.id();
+      
+      // Handle case where all points are removed or segments are too small
+      if (validSegments.length === 0) {
+        
+        
+        // Remove from data structures
+        const elementIndex = elements.value.findIndex(el => el.shape?.id === shapeId);
+        if (elementIndex !== -1) {
+          elements.value.splice(elementIndex, 1);
+         
+        }
+        
+        // Remove from layer and refs
+        shape.destroy();
+        shapeRefs.delete(shapeId);
+      } else {
+        // Process each valid segment
+        validSegments.forEach((segmentPoints, idx) => {
+          if (idx === 0) {
+            // Update existing shape with first segment
+            const newShape = new Konva.Line({
+              points: segmentPoints,
+              stroke: shape.stroke(),
+              strokeWidth: shape.strokeWidth(),
+              lineCap: 'round',
+              lineJoin: 'round',
+              tension: 0.3,
+              listening: true,
+              id: shapeId,
+              globalCompositeOperation: 'source-over'
+            });
+
+            // Update data structures
+            const elementIndex = elements.value.findIndex(el => el.shape?.id === shapeId);
+            if (elementIndex !== -1) {
+              elements.value[elementIndex].shape!.coordinates = [...segmentPoints];
+            }
+
+            // Replace shape in layer
+            shape.destroy();
+            mainLayer.value.add(newShape);
+            shapeRefs.set(shapeId, newShape);
+          } else {
+            // Create new shapes for additional segments
+            const newShapeId = crypto.randomUUID();
+            const segmentShape = new Konva.Line({
+              points: segmentPoints,
+              stroke: shape.stroke(),
+              strokeWidth: shape.strokeWidth(),
+              lineCap: 'round',
+              lineJoin: 'round',
+              tension: 0.3,
+              listening: true,
+              id: newShapeId,
+              globalCompositeOperation: 'source-over'
+            });
+
+            // Add new element for additional segment
+            elements.value.push({
+              id: crypto.randomUUID(),
+              shape: {
+                id: newShapeId,
+                type: 'line',
+                coordinates: [...segmentPoints],
+                isVisible: true,
+                isLocked: false,
+                color: shape.stroke(),
+                strokeWidth: shape.strokeWidth(),
+                opacity: shape.opacity()
+              },
+              timestamp: Date.now(),
+              isVisible: true
+            });
+            mainLayer.value.add(segmentShape);
+            shapeRefs.set(newShapeId, segmentShape);
+          }
+        });
+      }
+
+      // Force layer update
+      mainLayer.value.batchDraw();
+    }
   });
+  saveElementsToStorage();
 }
 
-// Utility Functions
+// Enhanced shape creation function
+function createShapeFromLine(line: Konva.Line) {
+  if (!stageRef.value || !mainLayer.value || selectedElementIndex.value === null) return;
+
+  const linePoints = line.points();
+  const elementIndex = selectedElementIndex.value;
+  const shapeId = crypto.randomUUID();
+
+  console.log('Creating new shape with ID:', shapeId);
+
+    // Calculate area if shape is closed
+    const area = calculateShapeArea(linePoints);
+
+  const shape = new Konva.Line({
+    points: linePoints,
+    stroke: brushColor.value,
+    strokeWidth: borderSize.value,
+    closed: false,
+    draggable: false,
+    opacity: opacity.value,
+    name: shapeId,
+    id: shapeId,
+    lineCap: 'round',
+    lineJoin: 'round',
+    tension: 0.5,
+    globalCompositeOperation: 'source-over',
+    listening: true
+  });
+
+  // Store the shape reference
+  shapeRefs.set(shapeId, shape);
+  console.log('Stored shape reference:', {
+    shapeId,
+    shape: shape instanceof Konva.Shape,
+    points: shape.points()
+  });
+
+  mainLayer.value.add(shape);
+
+  const shapeState: ShapeState = {
+    id: shapeId,
+    type: 'shape',
+    coordinates: linePoints,
+    isVisible: true,
+    isLocked: false,
+    color: brushColor.value,
+    strokeWidth: borderSize.value,
+    opacity: opacity.value,
+    area: area
+  };
+  if (area > 1) {
+    showToast(`Shape area: ${getFormattedArea(area)}`, 'info');
+  }
+  elements.value[elementIndex].shape = shapeState;
+  elements.value[elementIndex].timestamp = Date.now();
+  updateShapeLockStates();
+  line.destroy();
+  currentLine.value = null;
+  
+  updateHighlights();
+  saveElementsToStorage();
+}
+
+
 function toggleEraser() {
   isErasing.value = !isErasing.value;
   if (stageRef.value) {
     stageRef.value.container().style.cursor = isErasing.value ? 'crosshair' : 'default';
   }
 }
-
+// delete the  element 
 function deleteElement(index: number) {
   const elementToDelete = elements.value[index];
   
@@ -514,7 +718,7 @@ function deleteElement(index: number) {
 
   elements.value.splice(index, 1);
   selectedElementIndex.value = null;
-  
+  updateShapeLockStates();
   mainLayer.value?.batchDraw();
   updateHighlights();
   saveElementsToStorage();
@@ -664,11 +868,6 @@ function isCloseToStart(pos: Konva.Vector2d): boolean {
   return distance < 10;
 }
 
-// Watch for selection changes
-watch(selectedElementIndex, (newIndex, oldIndex) => {
-  updateHighlights();
-});
-
 function toggleElementLock(index: number) {
   const element = elements.value[index];
   if (!element.shape) return;
@@ -680,7 +879,7 @@ function toggleElementLock(index: number) {
   if (shape) {
     shape.draggable(!element.shape.isLocked);
   }
-  
+  updateShapeLockStates();
   saveElementsToStorage();
   showToast(
     element.shape.isLocked ? 'Shape locked' : 'Shape unlocked',
@@ -690,325 +889,14 @@ function toggleElementLock(index: number) {
   
 }
 
-
-function handleShapeIntersection(currentShape: Konva.Shape) {
-  console.log('🚀 Starting handleShapeIntersection', { 
-    currentShape,
-    hasMainLayer: !!mainLayer.value,
-    hasStage: !!stageRef.value,
-    totalShapeRefs: shapeRefs.size
-  });
-
-  // Debug: Print all stored shape refs
-  console.log('Current shapeRefs entries:', 
-    Array.from(shapeRefs.entries()).map(([id, shape]) => ({
-      id,
-      shape: shape instanceof Konva.Shape,
-      points: shape instanceof Konva.Line ? shape.points() : null
-    }))
-  );
-
-  if (!mainLayer.value || !stageRef.value) {
-    console.warn('❌ Missing mainLayer or stageRef');
-    return;
-  }
-
-  // Find the current shape's ID first
-  const currentShapeId = Array.from(shapeRefs.entries())
-    .find(([_, s]) => s === currentShape)?.[0];
-  
-  console.log('Current shape ID:', currentShapeId);
-
-  const currentBox = currentShape.getClientRect();
-  const intersectingLockedShapes: Konva.Shape[] = [];
-
-  // Find all intersecting locked shapes
-  mainLayer.value.children.forEach((shape, index) => {
-    if (shape === currentShape) {
-      console.log(`Skipping current shape at index ${index}`);
-      return;
-    }
-
-    const otherBox = shape.getClientRect();
-    console.log(`Checking shape at index ${index}:`, {
-      shape,
-      box: otherBox,
-      isKonvaShape: shape instanceof Konva.Shape,
-      isKonvaLine: shape instanceof Konva.Line
-    });
-
-    if (Konva.Util.haveIntersection(currentBox, otherBox)) {
-      // Try multiple methods to find the shape ID
-      let shapeId: string | undefined;
-      
-      // Method 1: Direct lookup from shapeRefs
-      const shapeEntry = Array.from(shapeRefs.entries())
-        .find(([_, s]) => s === shape);
-      shapeId = shapeEntry?.[0];
-      
-      // Method 2: Try to find by comparing coordinates (for Line shapes)
-      if (!shapeId && shape instanceof Konva.Line) {
-        const shapePoints = shape.points();
-        shapeId = Array.from(shapeRefs.entries())
-          .find(([_, s]) => 
-            s instanceof Konva.Line && 
-            JSON.stringify(s.points()) === JSON.stringify(shapePoints)
-          )?.[0];
-      }
-
-      console.log('Found intersecting shape:', {
-        shapeId,
-        hasIntersection: true,
-        shapeType: shape.getType(),
-        points: shape instanceof Konva.Line ? shape.points() : null
-      });
-
-      if (shapeId) {
-        const element = elements.value.find(el => el.shape?.id === shapeId);
-        console.log('Found element for shape:', {
-          elementFound: !!element,
-          isLocked: element?.shape?.isLocked,
-          shapeId
-        });
-        
-        if (element?.shape?.isLocked) {
-          console.log('Adding locked shape to intersections:', shapeId);
-          intersectingLockedShapes.push(shape);
-        }
-      } else {
-        console.warn('Could not find ID for intersecting shape');
-      }
-    }
-  });
-
-  console.log('📋 Final intersection results:', {
-    totalShapes: mainLayer.value.children.length,
-    intersectingShapes: intersectingLockedShapes.length,
-    currentShapeId
-  });
-
-
-  console.log('📋 Total intersecting locked shapes:', intersectingLockedShapes.length);
-
-  // Apply clipping
-  if (intersectingLockedShapes.length > 0) {
-    console.log('✂️ Processing intersections');
-    
-    intersectingLockedShapes.forEach(lockedShape => {
-      if (!(lockedShape instanceof Konva.Line) || !(currentShape instanceof Konva.Line)) return;
-      
-      const lockedPoints = lockedShape.points();
-      const currentPoints = currentShape.points();
-
-      // Find the two main intersection points
-      const intersections = findMainIntersectionPoints(lockedPoints, currentPoints);
-      console.log('Main intersection points:', intersections);
-
-      if (intersections.length === 2) {
-        // Create two segments excluding the intersection
-        const segments = createSegmentsExcludingIntersection(
-          lockedPoints, 
-          intersections[0], 
-          intersections[1]
-        );
-
-        // Create new shapes for valid segments
-        segments.forEach((segmentPoints, index) => {
-          if (segmentPoints.length < 4) return;
-          
-          const newSegment = new Konva.Line({
-            points: segmentPoints,
-            stroke: lockedShape.stroke(),
-            strokeWidth: lockedShape.strokeWidth(),
-            tension: lockedShape.tension(),
-            lineCap: 'round',
-            lineJoin: 'round',
-          });
-          
-          mainLayer.value?.add(newSegment);
-        });
-
-        // Remove original locked shape
-        lockedShape.remove();
-      }
-    });
-
-    mainLayer.value?.batchDraw();
-  }
-}
-
-function findMainIntersectionPoints(line1Points: number[], line2Points: number[]) {
-  const intersections: {x: number, y: number}[] = [];
-  
-  // Convert to line segments
-  for (let i = 0; i < line1Points.length - 2; i += 2) {
-    const l1 = {
-      x1: line1Points[i],
-      y1: line1Points[i + 1],
-      x2: line1Points[i + 2],
-      y2: line1Points[i + 3]
-    };
-    
-    for (let j = 0; j < line2Points.length - 2; j += 2) {
-      const l2 = {
-        x1: line2Points[j],
-        y1: line2Points[j + 1],
-        x2: line2Points[j + 2],
-        y2: line2Points[j + 3]
-      };
-      
-      const intersection = lineIntersection(l1, l2);
-      if (intersection && !isDuplicateIntersection(intersections, intersection)) {
-        intersections.push(intersection);
-      }
-    }
-  }
-  
-  // Return only the two most distant intersection points
-  return findTwoMostDistantPoints(intersections);
-}
-
-function createSegmentsExcludingIntersection(
-  points: number[], 
-  int1: {x: number, y: number}, 
-  int2: {x: number, y: number}
-) {
-  const segments: number[][] = [];
-  let currentSegment: number[] = [];
-  let isInIntersection = false;
-  
-  for (let i = 0; i < points.length; i += 2) {
-    const point = {x: points[i], y: points[i + 1]};
-    
-    // Check if we're at an intersection point
-    if (isPointNear(point, int1) || isPointNear(point, int2)) {
-      if (!isInIntersection) {
-        // End current segment
-        if (currentSegment.length > 0) {
-          segments.push([...currentSegment]);
-        }
-        currentSegment = [];
-        isInIntersection = true;
-      }
-    } else {
-      isInIntersection = false;
-      currentSegment.push(point.x, point.y);
-    }
-  }
-  
-  // Add final segment if exists
-  if (currentSegment.length > 0) {
-    segments.push(currentSegment);
-  }
-  
-  return segments;
-}
-
-function isPointNear(p1: {x: number, y: number}, p2: {x: number, y: number}) {
-  const threshold = 1;
-  return Math.abs(p1.x - p2.x) < threshold && Math.abs(p1.y - p2.y) < threshold;
-}
-
-function isDuplicateIntersection(
-  existing: {x: number, y: number}[], 
-  point: {x: number, y: number}
-) {
-  return existing.some(p => isPointNear(p, point));
-}
-
-function findTwoMostDistantPoints(points: {x: number, y: number}[]) {
-  if (points.length < 2) return points;
-  
-  let maxDist = 0;
-  let result = [points[0], points[1]];
-  
-  for (let i = 0; i < points.length; i++) {
-    for (let j = i + 1; j < points.length; j++) {
-      const dist = Math.hypot(points[i].x - points[j].x, points[i].y - points[j].y);
-      if (dist > maxDist) {
-        maxDist = dist;
-        result = [points[i], points[j]];
-      }
-    }
-  }
-  
-  return result;
-}
-
-function lineIntersection(line1: any, line2: any) {
-  const denominator = ((line2.y2 - line2.y1) * (line1.x2 - line1.x1)) - 
-                     ((line2.x2 - line2.x1) * (line1.y2 - line1.y1));
-                     
-  if (denominator === 0) return null;
-  
-  const ua = (((line2.x2 - line2.x1) * (line1.y1 - line2.y1)) - 
-              ((line2.y2 - line2.y1) * (line1.x1 - line2.x1))) / denominator;
-              
-  const ub = (((line1.x2 - line1.x1) * (line1.y1 - line2.y1)) - 
-              ((line1.y2 - line1.y1) * (line1.x1 - line2.x1))) / denominator;
-              
-  if (ua < 0 || ua > 1 || ub < 0 || ub > 1) return null;
-  
-  return {
-    x: line1.x1 + (ua * (line1.x2 - line1.x1)),
-    y: line1.y1 + (ua * (line1.y2 - line1.y1))
-  };
-}
-
-function createShapeFromLine(line: Konva.Line) {
-  if (!stageRef.value || !mainLayer.value || selectedElementIndex.value === null) return;
-
-  const linePoints = line.points();
-  const elementIndex = selectedElementIndex.value;
-  const shapeId = crypto.randomUUID();
-
-  console.log('Creating new shape with ID:', shapeId);
-
-  const shape = new Konva.Line({
-    points: linePoints,
-    stroke: brushColor.value,
-    strokeWidth: borderSize.value,
-    closed: false,
-    draggable: false,
-    opacity: opacity.value,
-    name: shapeId, // Add name attribute for easier identification
-    id: shapeId,   // Add id attribute as backup
-    customAttrs: { shapeId } // Add custom attribute as another backup
-  });
-
-  // Store the shape reference BEFORE adding to layer
-  shapeRefs.set(shapeId, shape);
-  console.log('Stored shape reference:', {
-    shapeId,
-    shape: shape instanceof Konva.Shape,
-    points: shape.points()
-  });
-
-  mainLayer.value.add(shape);
-
-  const shapeState: ShapeState = {
-    id: shapeId,
-    type: 'shape',
-    coordinates: linePoints,
-    isVisible: true,
-    isLocked: false,  // Make sure shapes are locked by default
-    color: brushColor.value,
-    strokeWidth: borderSize.value,
-    opacity: opacity.value
-  };
-  
-  elements.value[elementIndex].shape = shapeState;
-  elements.value[elementIndex].timestamp = Date.now();
-  
-  handleShapeIntersection(shape);
-  
-  line.destroy();
-  currentLine.value = null;
-  
+// Watch 
+watch(selectedElementIndex, (newIndex, oldIndex) => {
   updateHighlights();
-  saveElementsToStorage();
-}
-
+});
+watch(shapeLockStates, (newStates) => {
+  console.log('Lock states updated:', newStates);
+  
+});
 watch([elements, () => shapeRefs.size], ([newElements, newSize], [oldElements, oldSize]) => {
   console.log('State updated:', {
     elementsCount: newElements.length,
@@ -1018,7 +906,467 @@ watch([elements, () => shapeRefs.size], ([newElements, newSize], [oldElements, o
 });
 
 
+// End of Watch
+// trial logic
+// area logic
+function calculateShapeArea(points: number[]): number {
+  if (points.length < 6) return 0; // Need at least 3 points (6 coordinates) for an area
 
+  let area = 0;
+  
+  // Convert flat array to points array for easier processing
+  const vertices: { x: number; y: number }[] = [];
+  for (let i = 0; i < points.length; i += 2) {
+    vertices.push({
+      x: points[i],
+      y: points[i + 1]
+    });
+  }
+
+  // Add first point to end to close the shape
+  vertices.push(vertices[0]);
+
+  // Calculate area using Shoelace formula
+  for (let i = 0; i < vertices.length - 1; i++) {
+    const current = vertices[i];
+    const next = vertices[i + 1];
+    area += (current.x * next.y) - (next.x * current.y);
+  }
+
+  // Take absolute value and divide by 2
+  return Math.abs(area) / 2;
+}
+function getFormattedArea(area: number): string {
+  if (area < 1) {
+    return '< 1 px²';
+  }
+  return `${Math.round(area)} px²`;
+}
+function getShapeArea(shapeId: string): string {
+  const element = elements.value.find(el => el.shape?.id === shapeId);
+  if (!element?.shape?.coordinates) return 'N/A';
+  
+  const area = calculateShapeArea(element.shape.coordinates);
+  return getFormattedArea(area);
+}
+// end of area logic
+//highlight area logic
+
+function highlightShapeArea(shapeId: string) {
+  if (!areaHighlightLayer.value) return;
+
+  // Clear previous highlights
+  clearAreaHighlights();
+
+  const element = elements.value.find(el => el.shape?.id === shapeId);
+  if (!element?.shape?.coordinates) return;
+
+  // Create highlight shape
+  const highlightShape = new Konva.Line({
+    points: element.shape.coordinates,
+    closed: true,
+    fill: 'rgba(255, 192, 203, 0.3)', // Light pink with transparency
+    stroke: 'rgba(255, 182, 193, 0.5)', // Slightly darker pink for border
+    strokeWidth: 2,
+    listening: false, // Make it non-interactive
+    name: 'area-highlight'
+  });
+
+  // Add area text
+  const area = calculateShapeArea(element.shape.coordinates);
+  const centroid = calculateCentroid(element.shape.coordinates);
+  
+  const areaText = new Konva.Text({
+    x: centroid.x,
+    y: centroid.y,
+    text: getFormattedArea(area),
+    fontSize: 14,
+    fontFamily: 'Arial',
+    fill: '#FF69B4',
+    align: 'center',
+    verticalAlign: 'middle',
+    listening: false,
+    name: 'area-text'
+  });
+
+  // Center the text
+  areaText.offsetX(areaText.width() / 2);
+  areaText.offsetY(areaText.height() / 2);
+
+  areaHighlightLayer.value.add(highlightShape);
+  areaHighlightLayer.value.add(areaText);
+  areaHighlightLayer.value.batchDraw();
+}
+
+function clearAreaHighlights() {
+  if (!areaHighlightLayer.value) return;
+  
+  // Remove all highlights
+  const highlights = areaHighlightLayer.value.find('.area-highlight');
+  const texts = areaHighlightLayer.value.find('.area-text');
+  
+  highlights.forEach(node => node.destroy());
+  texts.forEach(node => node.destroy());
+  
+  areaHighlightLayer.value.batchDraw();
+}
+
+// Helper function to calculate centroid of a shape
+function calculateCentroid(points: number[]): { x: number; y: number } {
+  let sumX = 0;
+  let sumY = 0;
+  const totalPoints = points.length / 2;
+
+  for (let i = 0; i < points.length; i += 2) {
+    sumX += points[i];
+    sumY += points[i + 1];
+  }
+
+  return {
+    x: sumX / totalPoints,
+    y: sumY / totalPoints
+  };
+}
+// end of highlight area logic
+// intersection logic
+function findShapeIntersections(shapeId1: string, shapeId2: string): IntersectionResult | null {
+  const shape1 = elements.value.find(el => el.shape?.id === shapeId1)?.shape;
+  const shape2 = elements.value.find(el => el.shape?.id === shapeId2)?.shape;
+
+  if (!shape1?.coordinates || !shape2?.coordinates) return null;
+
+  const intersections: IntersectionResult = {};
+  let intersectionCount = 0;
+
+  // Convert coordinates to line segments
+  const segments1 = getLineSegments(shape1.coordinates);
+  const segments2 = getLineSegments(shape2.coordinates);
+
+  // Check each segment pair for intersections
+  segments1.forEach((seg1, i) => {
+    segments2.forEach((seg2, j) => {
+      const intersection = findSegmentIntersection(
+        seg1.start,
+        seg1.end,
+        seg2.start,
+        seg2.end
+      );
+
+      if (intersection) {
+        intersectionCount++;
+        intersections[`cut${intersectionCount}`] = {
+          points: [
+            { x: intersection.x, y: intersection.y },
+            { x: intersection.x, y: intersection.y }
+          ]
+        };
+      }
+    });
+  });
+
+  return Object.keys(intersections).length > 0 ? intersections : null;
+}
+function getLineSegments(coordinates: number[]): { start: Point; end: Point }[] {
+  const segments = [];
+  
+  for (let i = 0; i < coordinates.length - 2; i += 2) {
+    segments.push({
+      start: { x: coordinates[i], y: coordinates[i + 1] },
+      end: { x: coordinates[i + 2], y: coordinates[i + 3] }
+    });
+  }
+
+  // Add closing segment if shape is closed
+  if (coordinates.length >= 4) {
+    segments.push({
+      start: { 
+        x: coordinates[coordinates.length - 2], 
+        y: coordinates[coordinates.length - 1] 
+      },
+      end: { 
+        x: coordinates[0], 
+        y: coordinates[1] 
+      }
+    });
+  }
+
+  return segments;
+}
+
+// Helper function to find intersection between two line segments
+function findSegmentIntersection(
+  p1: Point,
+  p2: Point,
+  p3: Point,
+  p4: Point
+): Point | null {
+  const denominator = (p4.y - p3.y) * (p2.x - p1.x) - (p4.x - p3.x) * (p2.y - p1.y);
+  
+  if (denominator === 0) {
+    return null; // Lines are parallel
+  }
+
+  const ua = ((p4.x - p3.x) * (p1.y - p3.y) - (p4.y - p3.y) * (p1.x - p3.x)) / denominator;
+  const ub = ((p2.x - p1.x) * (p1.y - p3.y) - (p2.y - p1.y) * (p1.x - p3.x)) / denominator;
+
+  // Check if intersection occurs within both line segments
+  if (ua < 0 || ua > 1 || ub < 0 || ub > 1) {
+    return null;
+  }
+
+  return {
+    x: p1.x + ua * (p2.x - p1.x),
+    y: p1.y + ua * (p2.y - p1.y)
+  };
+}
+
+// Optional: Add function to highlight intersection points
+function highlightIntersections(intersections: IntersectionResult) {
+  if (!areaHighlightLayer.value) return;
+
+  clearIntersectionHighlights();
+
+  Object.values(intersections).forEach(intersection => {
+    intersection.points.forEach(point => {
+      const highlight = new Konva.Circle({
+        x: point.x,
+        y: point.y,
+        radius: 5,
+        fill: '#FF1493',
+        stroke: '#FF69B4',
+        strokeWidth: 2,
+        name: 'intersection-point'
+      });
+
+      areaHighlightLayer.value?.add(highlight);
+    });
+  });
+
+  areaHighlightLayer.value.batchDraw();
+}
+
+function clearIntersectionHighlights() {
+  if (!areaHighlightLayer.value) return;
+  
+  const highlights = areaHighlightLayer.value.find('.intersection-point');
+  highlights.forEach(node => node.destroy());
+  
+  areaHighlightLayer.value.batchDraw();
+}
+
+// Example usage function
+function findAndHighlightIntersections(shapeId1: string, shapeId2: string) {
+  const intersections = findShapeIntersections(shapeId1, shapeId2);
+  
+  if (intersections) {
+    console.log('Intersection points:', intersections);
+    highlightIntersections(intersections);
+    return intersections;
+  } else {
+    console.log('No intersections found');
+    return null;
+  }
+}
+function findIntersectionsWithSelected() {
+  if (selectedElementIndex === null) return;
+  
+  const selectedShape = elements.value[selectedElementIndex.value];
+  if (!selectedShape.shape?.id) return;
+
+  // Find intersections with all other shapes
+  elements.value.forEach((element, index) => {
+    if (index !== selectedElementIndex.value && element.shape?.id) {
+      const intersections = findAndHighlightIntersections(
+        selectedShape.shape!.id,
+        element.shape.id
+      );
+      
+      if (intersections) {
+        showToast(`Found ${Object.keys(intersections).length} intersection points`, 'info');
+      }
+    }
+  });
+}
+// end of intersection logic
+// locked area  erasing logic
+function eraseLockedAreas() {
+  console.log('Starting locked area erasing process');
+  if (!mainLayer.value) {
+    console.log('No main layer found, aborting');
+    return;
+  }
+
+  // Get all locked shapes
+  const lockedShapes = shapeLockStates.value
+    .filter(state => state.isLocked)
+    .map(state => ({
+      id: state.id,
+      shape: elements.value.find(el => el.shape?.id === state.id)?.shape
+    }))
+    .filter(item => item.shape !== undefined);
+
+  console.log(`Found ${lockedShapes.length} locked shapes`);
+
+  if (lockedShapes.length === 0) {
+    showToast('No locked shapes found', 'info');
+    return;
+  }
+
+  // Process each shape on the layer
+  const shapes = mainLayer.value.children?.filter(
+    child => child instanceof Konva.Line && child.visible()
+  ) as Konva.Line[] || [];
+
+  console.log(`Processing ${shapes.length} visible lines`);
+  let totalPointsErased = 0;
+  let shapesModified = 0;
+  let shapesRemoved = 0;
+
+  shapes.forEach(shape => {
+    // Skip if this shape is locked
+    const shapeId = shape.id();
+    const isLocked = shapeLockStates.value.some(state => 
+      state.isLocked && state.id === shapeId
+    );
+    
+    if (isLocked) {
+      console.log(`Skipping locked shape ${shapeId}`);
+      return;
+    }
+
+    const points = shape.points();
+    let modified = false;
+    let newSegments: number[][] = [[]];
+    let currentSegment = 0;
+    
+    console.log(`Processing unlocked shape ${shapeId} with ${points.length / 2} points`);
+    
+    // First pass: collect points into segments
+    for (let i = 0; i < points.length; i += 2) {
+      const pointX = points[i];
+      const pointY = points[i + 1];
+      const currentPoint = { x: pointX, y: pointY };
+      
+      let isPointInLocked = false;
+      for (const lockedItem of lockedShapes) {
+        if (lockedItem.shape && isPointInShape(currentPoint, lockedItem.shape.coordinates)) {
+          isPointInLocked = true;
+          modified = true;
+          totalPointsErased++;
+          break;
+        }
+      }
+
+      if (!isPointInLocked) {
+        // Add point to current segment
+        newSegments[currentSegment].push(pointX, pointY);
+      } else {
+        // If we have points in the current segment and the next point is also outside,
+        // we'll keep the current segment and start a new one
+        if (newSegments[currentSegment].length > 0) {
+          currentSegment++;
+          newSegments[currentSegment] = [];
+        }
+      }
+    }
+    
+    if (modified) {
+      shapesModified++;
+      
+      // Filter valid segments (more than 2 points to form a line)
+      const validSegments = newSegments.filter(seg => seg.length >= 4);
+      
+      if (validSegments.length === 0) {
+        console.log(`Removing shape ${shapeId} - no valid segments remain`);
+        const elementIndex = elements.value.findIndex(el => el.shape?.id === shapeId);
+        if (elementIndex !== -1) {
+          elements.value.splice(elementIndex, 1);
+        }
+        shape.destroy();
+        shapeRefs.delete(shapeId);
+        shapesRemoved++;
+      } else {
+        // Combine all valid segments with small gaps between them
+        const combinedPoints: number[] = [];
+        validSegments.forEach((segment, index) => {
+          if (index > 0) {
+            // Add a small move between segments to create a visual break
+            const lastX = combinedPoints[combinedPoints.length - 2];
+            const lastY = combinedPoints[combinedPoints.length - 1];
+            const nextX = segment[0];
+            const nextY = segment[1];
+            
+            // Add the segment with its points
+            combinedPoints.push(...segment);
+          } else {
+            combinedPoints.push(...segment);
+          }
+        });
+        
+        console.log(`Updating shape ${shapeId} with ${combinedPoints.length / 2} total points from ${validSegments.length} segments`);
+        shape.points(combinedPoints);
+        
+        // Update data structures
+        const elementIndex = elements.value.findIndex(el => el.shape?.id === shapeId);
+        if (elementIndex !== -1) {
+          elements.value[elementIndex].shape!.coordinates = combinedPoints;
+        }
+      }
+    }
+  });
+
+  console.log('Erasing process completed:');
+  console.log(`- Total points erased: ${totalPointsErased}`);
+  console.log(`- Shapes modified: ${shapesModified}`);
+  console.log(`- Shapes removed: ${shapesRemoved}`);
+
+  mainLayer.value.batchDraw();
+  saveElementsToStorage();
+}
+
+function toggleLockedAreaEraser() {
+  isLockedAreaErasing.value = !isLockedAreaErasing.value;
+  isErasing.value = false; // Disable regular eraser
+  
+  if (isLockedAreaErasing.value) {
+    console.log('Locked area eraser activated - performing immediate erase');
+    eraseLockedAreas();
+  }
+  
+  if (stageRef.value) {
+    stageRef.value.container().style.cursor = 'default';
+  }
+}
+
+// The isPointInShape function remains unchanged as it's working correctly
+function isPointInShape(point: Point, shapeCoordinates: number[]): boolean {
+  let inside = false;
+  const x = point.x;
+  const y = point.y;
+
+  // Convert flat array to points for processing
+  const vertices = [];
+  for (let i = 0; i < shapeCoordinates.length; i += 2) {
+    vertices.push({
+      x: shapeCoordinates[i],
+      y: shapeCoordinates[i + 1]
+    });
+  }
+
+  // Ray casting algorithm to determine if point is inside polygon
+  for (let i = 0, j = vertices.length - 1; i < vertices.length; j = i++) {
+    const xi = vertices[i].x;
+    const yi = vertices[i].y;
+    const xj = vertices[j].x;
+    const yj = vertices[j].y;
+
+    const intersect = ((yi > y) !== (yj > y)) &&
+      (x < (xj - xi) * (y - yi) / (yj - yi) + xi);
+    if (intersect) inside = !inside;
+  }
+
+  return inside;
+}
 </script>
 
 <style scoped>
@@ -1039,6 +1387,10 @@ watch([elements, () => shapeRefs.size], ([newElements, newSize], [oldElements, o
   box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
   overflow: hidden;
   position: relative;
+  width: 100%;
+  height: 100%;
+  min-height: 600px;
+  min-width: 800px;
 }
 
 .controls {
@@ -1047,6 +1399,7 @@ watch([elements, () => shapeRefs.size], ([newElements, newSize], [oldElements, o
   left: 20px;
   z-index: 100;
   display: flex;
+  flex-direction: column;
   flex-wrap: wrap;
   gap: 12px;
   background: white;
@@ -1268,6 +1621,19 @@ input[type="range"] {
   background: #2196F3;
 }
 
+.area-highlight {
+  pointer-events: none;
+  transition: opacity 0.2s ease;
+}
+
+.area-text {
+  pointer-events: none;
+  transition: opacity 0.2s ease;
+}
+.intersection-point {
+  pointer-events: none;
+  transition: all 0.2s ease;
+}
 @media (max-width: 1200px) {
   .drawing-app {
     grid-template-columns: 1fr 250px;
