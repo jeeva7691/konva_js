@@ -635,7 +635,7 @@ function continueErasing(pos: Konva.Vector2d) {
 }
 
 // Enhanced shape creation function
-function createShapeFromLine(line: Konva.Line) {
+async function createShapeFromLine(line: Konva.Line) {
   if (!stageRef.value || !mainLayer.value || selectedElementIndex.value === null) return;
 
   const linePoints = line.points();
@@ -694,6 +694,7 @@ function createShapeFromLine(line: Konva.Line) {
   currentLine.value = null;
   
   updateHighlights();
+  await eraseLockedAreas();
   saveElementsToStorage();
 }
 
@@ -1189,151 +1190,18 @@ function findIntersectionsWithSelected() {
 }
 // end of intersection logic
 // locked area  erasing logic
-async function generateBorderPath(startPoint: Point, endPoint: Point, borderPoints: number[], offset: number): Promise<Point[]> {
-  console.log('=== Starting Border Path Generation ===');
-  console.log('Start Point:', startPoint);
-  console.log('End Point:', endPoint);
-
-  const len = borderPoints.length;
-  let startIdx = -1;
-  let endIdx = -1;
-  let minStartDist = Infinity;
-  let minEndDist = Infinity;
-
-  // Find closest border points
-  for (let i = 0; i < len; i += 2) {
-    const borderX = borderPoints[i];
-    const borderY = borderPoints[i + 1];
-    
-    const startDist = Math.sqrt(
-      Math.pow(startPoint.x - borderX, 2) + 
-      Math.pow(startPoint.y - borderY, 2)
-    );
-    const endDist = Math.sqrt(
-      Math.pow(endPoint.x - borderX, 2) + 
-      Math.pow(endPoint.y - borderY, 2)
-    );
-
-    if (startDist < minStartDist) {
-      minStartDist = startDist;
-      startIdx = i;
-      console.log('New closest start point:', { x: borderX, y: borderY, distance: startDist });
-    }
-    if (endDist < minEndDist) {
-      minEndDist = endDist;
-      endIdx = i;
-      console.log('New closest end point:', { x: borderX, y: borderY, distance: endDist });
-    }
-  }
-
-  // Calculate path lengths
-  console.log('Calculating path lengths...');
-  let clockwisePoints: Point[] = [];
-  let counterPoints: Point[] = [];
-  let idx = startIdx;
-
-  // Clockwise collection
-  while (idx !== endIdx) {
-    const p1 = { x: borderPoints[idx], y: borderPoints[idx + 1] };
-    clockwisePoints.push(p1);
-    idx = (idx + 2) % len;
-  }
-  clockwisePoints.push({ x: borderPoints[endIdx], y: borderPoints[endIdx + 1] });
-
-  // Counter-clockwise collection
-  idx = startIdx;
-  while (idx !== endIdx) {
-    const p1 = { x: borderPoints[idx], y: borderPoints[idx + 1] };
-    counterPoints.push(p1);
-    idx = (idx - 2 + len) % len;
-  }
-  counterPoints.push({ x: borderPoints[endIdx], y: borderPoints[endIdx + 1] });
-
-  const clockwiseLen = calculatePathLength(clockwisePoints);
-  const counterLen = calculatePathLength(counterPoints);
-  
-  console.log('Path lengths:', {
-    clockwise: clockwiseLen,
-    counterclockwise: counterLen
-  });
-
-  // Choose shorter path
-  const finalPoints = clockwiseLen <= counterLen ? clockwisePoints : counterPoints;
-  console.log(`Chose ${clockwiseLen <= counterLen ? 'clockwise' : 'counter-clockwise'} path`);
-
-  // Generate offset points with visualization delay
-  const offsetPoints: Point[] = [];
-  const debugLayer = new Konva.Layer();
-  mainLayer.value?.getStage()?.add(debugLayer);
-
-  for (let i = 0; i < finalPoints.length - 1; i++) {
-    const p1 = finalPoints[i];
-    const p2 = finalPoints[i + 1];
-    
-    // Calculate normal
-    const dx = p2.x - p1.x;
-    const dy = p2.y - p1.y;
-    const len = Math.sqrt(dx * dx + dy * dy);
-    const normalX = -dy / len;
-    const normalY = dx / len;
-
-    // Calculate offset point
-    const offsetPoint = {
-      x: p1.x + normalX * offset,
-      y: p1.y + normalY * offset
-    };
-    offsetPoints.push(offsetPoint);
-
-    // Visualize current point
-    const point = new Konva.Circle({
-      x: offsetPoint.x,
-      y: offsetPoint.y,
-      radius: 2,
-      fill: 'blue',
-      opacity: 0.5
-    });
-    debugLayer.add(point);
-    debugLayer.draw();
-
-    console.log('Generated offset point:', {
-      original: p1,
-      offset: offsetPoint,
-      normal: { x: normalX, y: normalY }
-    });
-
-    // Add delay for visualization
-    await new Promise(resolve => setTimeout(resolve, 1000));
-  }
-
-  // Add final point
-  offsetPoints.push({
-    x: endPoint.x,
-    y: endPoint.y
-  });
-
-  // Clean up debug visualization after delay
-  setTimeout(() => {
-    debugLayer.destroy();
-  }, 2000);
-
-  return offsetPoints;
-}
-
-function calculatePathLength(points: Point[]): number {
-  let length = 0;
-  for (let i = 0; i < points.length - 1; i++) {
-    const p1 = points[i];
-    const p2 = points[i + 1];
-    length += Math.sqrt(
-      Math.pow(p2.x - p1.x, 2) + Math.pow(p2.y - p1.y, 2)
-    );
-  }
-  return length;
-}
-
 async function eraseLockedAreas() {
   console.log('=== Starting Locked Area Erasing ===');
-  if (!mainLayer.value) return;
+  console.log('Initial state:', {
+    mainLayerExists: !!mainLayer.value,
+    elementsCount: elements.value.length,
+    lockStatesCount: shapeLockStates.value.length
+  });
+  
+  if (!mainLayer.value) {
+    console.warn('No main layer found, exiting');
+    return;
+  }
 
   const lockedShapes = shapeLockStates.value
     .filter(state => state.isLocked)
@@ -1343,9 +1211,17 @@ async function eraseLockedAreas() {
     }))
     .filter(item => item.shape !== undefined);
 
-  console.log('Found locked shapes:', lockedShapes);
+  console.log('Found locked shapes:', {
+    totalLocked: lockedShapes.length,
+    shapes: lockedShapes.map(shape => ({
+      id: shape.id,
+      coordinates: shape.shape?.coordinates?.length,
+      bounds: calculateShapeBounds(shape.shape?.coordinates || [])
+    }))
+  });
 
   if (lockedShapes.length === 0) {
+    console.log('No locked shapes found, showing toast and exiting');
     showToast('No locked shapes found', 'info');
     return;
   }
@@ -1354,6 +1230,11 @@ async function eraseLockedAreas() {
     child => child instanceof Konva.Line && child.visible()
   ) as Konva.Line[] || [];
 
+  console.log('Found visible lines:', {
+    totalShapes: shapes.length,
+    shapeIds: shapes.map(s => s.id())
+  });
+
   for (const shape of shapes) {
     const shapeId = shape.id();
     if (shapeLockStates.value.some(state => state.isLocked && state.id === shapeId)) {
@@ -1361,13 +1242,20 @@ async function eraseLockedAreas() {
       continue;
     }
 
-    console.log(`Processing shape ${shapeId}`);
+    console.log(`\n=== Processing shape ${shapeId} ===`);
     const points = shape.points();
+    console.log('Shape points:', {
+      total: points.length / 2,
+      first: { x: points[0], y: points[1] },
+      last: { x: points[points.length - 2], y: points[points.length - 1] }
+    });
+
     const segments: number[][] = [];
     let currentSegment: number[] = [];
     let isInside = false;
-
+    
     // First, split into segments based on intersection
+    console.log('Starting intersection analysis...');
     for (let i = 0; i < points.length; i += 2) {
       const point = { x: points[i], y: points[i + 1] };
       const wasInside = isInside;
@@ -1376,41 +1264,54 @@ async function eraseLockedAreas() {
       for (const lockedItem of lockedShapes) {
         if (lockedItem.shape && isPointInShape(point, lockedItem.shape.coordinates)) {
           isInside = true;
+          console.log(`Point ${i/2} is inside shape ${lockedItem.id}:`, {
+            point,
+            wasInside,
+            isNowInside: isInside
+          });
           break;
         }
       }
-
+      
       if (!isInside) {
-        // Point is outside - add to current segment
         currentSegment.push(point.x, point.y);
+        if (wasInside) {
+          console.log(`Point ${i/2} exited locked area, starting new segment`);
+        }
       } else if (!wasInside && currentSegment.length > 0) {
-        // Just entered locked area - finish current segment
+        console.log(`Point ${i/2} entered locked area, finishing segment:`, {
+          segmentPoints: currentSegment.length / 2
+        });
         segments.push([...currentSegment]);
         currentSegment = [];
       }
-
-      // If we just exited the locked area, start a new segment
-      if (wasInside && !isInside) {
-        currentSegment = [point.x, point.y];
-      }
     }
 
-    // Add final segment if it exists
     if (currentSegment.length > 0) {
+      console.log('Adding final segment:', {
+        points: currentSegment.length / 2
+      });
       segments.push(currentSegment);
     }
+
+    console.log('Segments analysis complete:', {
+      totalSegments: segments.length,
+      segmentLengths: segments.map(s => s.length / 2)
+    });
 
     // Now process segments and add connecting paths
     if (segments.length >= 2) {
       const finalPoints: number[] = [];
       
+      console.log('\nStarting segment connection process...');
       for (let i = 0; i < segments.length; i++) {
         const currentSegment = segments[i];
+        console.log(`\nProcessing segment ${i}:`, {
+          points: currentSegment.length / 2
+        });
         
-        // Add current segment points
         finalPoints.push(...currentSegment);
 
-        // If there's a next segment, we need to connect to it
         if (i < segments.length - 1) {
           const nextSegment = segments[i + 1];
           
@@ -1424,9 +1325,12 @@ async function eraseLockedAreas() {
             y: nextSegment[1]
           };
 
-          console.log(`Connecting segments from (${startPoint.x}, ${startPoint.y}) to (${endPoint.x}, ${endPoint.y})`);
+          console.log(`Generating border path between segments ${i} and ${i+1}:`, {
+            from: startPoint,
+            to: endPoint,
+            lockedShapePoints: lockedShapes[0].shape!.coordinates.length / 2
+          });
           
-          // Generate connecting path
           const borderPath = await generateBorderPath(
             startPoint,
             endPoint,
@@ -1434,26 +1338,319 @@ async function eraseLockedAreas() {
             5
           );
 
-          // Only add the path points (don't duplicate intersection points)
+          console.log('Border path generated:', {
+            totalPoints: borderPath.length,
+            firstPoint: borderPath[0],
+            lastPoint: borderPath[borderPath.length - 1]
+          });
+
           for (let j = 1; j < borderPath.length - 1; j++) {
             finalPoints.push(borderPath[j].x, borderPath[j].y);
           }
         }
       }
 
-      // Update shape with final points
-      console.log(`Updating shape with ${finalPoints.length / 2} points`);
+      console.log('\nFinal path statistics:', {
+        originalPoints: points.length / 2,
+        finalPoints: finalPoints.length / 2,
+        segments: segments.length
+      });
+
       shape.points(finalPoints);
       
       const elementIndex = elements.value.findIndex(el => el.shape?.id === shapeId);
       if (elementIndex !== -1) {
         elements.value[elementIndex].shape!.coordinates = finalPoints;
+        console.log('Updated element in storage:', {
+          elementIndex,
+          newPointCount: finalPoints.length / 2
+        });
       }
+    } else {
+      console.log('Not enough segments to process:', {
+        segmentCount: segments.length
+      });
     }
   }
 
+  console.log('\n=== Completing erase operation ===');
   mainLayer.value.batchDraw();
   saveElementsToStorage();
+}
+
+function calculateShapeBounds(coordinates: number[]) {
+  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+  for (let i = 0; i < coordinates.length; i += 2) {
+    minX = Math.min(minX, coordinates[i]);
+    maxX = Math.max(maxX, coordinates[i]);
+    minY = Math.min(minY, coordinates[i + 1]);
+    maxY = Math.max(maxY, coordinates[i + 1]);
+  }
+  return { minX, maxX, minY, maxY };
+}
+
+// Update generateBorderPath to include more logging
+async function generateBorderPath(startPoint: Point, endPoint: Point, borderPoints: number[], offset: number): Promise<Point[]> {
+  console.log('=== Starting Border Path Generation ===');
+  
+  // Increase offset for better clearance
+  const safeOffset = offset * 1.5; // Increased safety margin
+  
+  // First, project start and end points outward from the shape
+  const projectPointOutward = (point: Point): Point => {
+  // Find closest border segment instead of just closest point
+  let closestSegmentStart = -1;
+  let minDist = Infinity;
+  let projectedPoint: Point = { x: 0, y: 0 };
+  
+  // Find closest line segment and project onto it
+  for (let i = 0; i < borderPoints.length - 2; i += 2) {
+    const p1 = { x: borderPoints[i], y: borderPoints[i + 1] };
+    const p2 = { 
+      x: borderPoints[(i + 2) % borderPoints.length], 
+      y: borderPoints[(i + 3) % borderPoints.length] 
+    };
+    
+    // Calculate projection onto line segment
+    const projection = projectPointOntoSegment(point, p1, p2);
+    const dist = getDistance(point, projection);
+    
+    if (dist < minDist) {
+      minDist = dist;
+      closestSegmentStart = i;
+      projectedPoint = projection;
+    }
+  }
+  
+  // Calculate normal vector to the closest segment
+  const p1 = { 
+    x: borderPoints[closestSegmentStart], 
+    y: borderPoints[closestSegmentStart + 1] 
+  };
+  const p2 = { 
+    x: borderPoints[(closestSegmentStart + 2) % borderPoints.length], 
+    y: borderPoints[(closestSegmentStart + 3) % borderPoints.length] 
+  };
+  
+  // Calculate segment direction vector
+  const dx = p2.x - p1.x;
+  const dy = p2.y - p1.y;
+  const len = Math.sqrt(dx * dx + dy * dy);
+  
+  // Calculate normal vector (perpendicular to segment)
+  const normalX = -dy / len;
+  const normalY = dx / len;
+  
+  // Determine if point is "inside" or "outside" the shape
+  const isInside = isPointInShape(point, borderPoints);
+  const direction = isInside ? -1 : 1;
+  
+  // Project point outward along normal vector
+  return {
+    x: projectedPoint.x + normalX * safeOffset * direction,
+    y: projectedPoint.y + normalY * safeOffset * direction
+  };
+};
+
+  const projectedStart = projectPointOutward(startPoint);
+  const projectedEnd = projectPointOutward(endPoint);
+  
+  // Generate expanded boundary points
+  const expandedBorderPoints: Point[] = [];
+  for (let i = 0; i < borderPoints.length; i += 2) {
+    const current = { x: borderPoints[i], y: borderPoints[i + 1] };
+    const next = { 
+      x: borderPoints[(i + 2) % borderPoints.length], 
+      y: borderPoints[(i + 3) % borderPoints.length] 
+    };
+    
+    // Calculate normal vector
+    const dx = next.x - current.x;
+    const dy = next.y - current.y;
+    const len = Math.sqrt(dx * dx + dy * dy);
+    const normalX = -dy / len;
+    const normalY = dx / len;
+    
+    // Add expanded point
+    expandedBorderPoints.push({
+      x: current.x + normalX * safeOffset,
+      y: current.y + normalY * safeOffset
+    });
+  }
+  
+  // Find closest expanded border points to projected points
+  let startIdx = -1;
+  let endIdx = -1;
+  let minStartDist = Infinity;
+  let minEndDist = Infinity;
+  
+  for (let i = 0; i < expandedBorderPoints.length; i++) {
+    const borderPoint = expandedBorderPoints[i];
+    
+    const startDist = Math.sqrt(
+      Math.pow(projectedStart.x - borderPoint.x, 2) + 
+      Math.pow(projectedStart.y - borderPoint.y, 2)
+    );
+    const endDist = Math.sqrt(
+      Math.pow(projectedEnd.x - borderPoint.x, 2) + 
+      Math.pow(projectedEnd.y - borderPoint.y, 2)
+    );
+    
+    if (startDist < minStartDist) {
+      minStartDist = startDist;
+      startIdx = i;
+    }
+    if (endDist < minEndDist) {
+      minEndDist = endDist;
+      endIdx = i;
+    }
+  }
+  
+  // Generate both possible paths using expanded points
+
+// Add validation when creating paths
+const clockwisePath: Point[] = [];
+for (let idx = startIdx; idx !== endIdx; idx = (idx + 1) % expandedBorderPoints.length) {
+  const point = expandedBorderPoints[idx];
+  if (isValidPoint(point)) {
+    clockwisePath.push(point);
+  }
+}
+if (isValidPoint(expandedBorderPoints[endIdx])) {
+  clockwisePath.push(expandedBorderPoints[endIdx]);
+}
+
+const counterPath: Point[] = [];
+for (let idx = startIdx; idx !== endIdx; idx = (idx - 1 + expandedBorderPoints.length) % expandedBorderPoints.length) {
+  const point = expandedBorderPoints[idx];
+  if (isValidPoint(point)) {
+    counterPath.push(point);
+  }
+}
+if (isValidPoint(expandedBorderPoints[endIdx])) {
+  counterPath.push(expandedBorderPoints[endIdx]);
+}
+  
+  // Choose shorter path
+  const clockwiseLength = calculatePathLength(clockwisePath);
+  const counterLength = calculatePathLength(counterPath);
+  
+  const finalPath = [
+    startPoint,
+    projectedStart,
+    ...(clockwiseLength <= counterLength ? clockwisePath : counterPath),
+    projectedEnd,
+    endPoint
+  ];
+  
+  // Smooth the path
+  const smoothedPath = smoothPath(finalPath, 0.5);
+  
+  // Visualize for debugging
+  if (mainLayer.value?.getStage()) {
+    const debugLayer = new Konva.Layer();
+    mainLayer.value.getStage()?.add(debugLayer);
+    
+    // Draw expanded boundary
+    const expandedBoundary = new Konva.Line({
+      points: expandedBorderPoints.flatMap(p => [p.x, p.y]),
+      stroke: 'rgba(0, 255, 0, 0.3)',
+      closed: true
+    });
+    debugLayer.add(expandedBoundary);
+    
+    // Draw path points
+    for (const point of smoothedPath) {
+      const circle = new Konva.Circle({
+        x: point.x,
+        y: point.y,
+        radius: 2,
+        fill: 'blue',
+        opacity: 0.5
+      });
+      debugLayer.add(circle);
+    }
+    
+    debugLayer.draw();
+    
+    setTimeout(() => debugLayer.destroy(), 2000);
+  }
+  
+  return smoothedPath;
+}
+
+function smoothPath(points: Point[], tension: number): Point[] {
+  if (points.length < 3) return points;
+  
+  const smoothedPoints: Point[] = [];
+  
+  // Keep start point
+  smoothedPoints.push(points[0]);
+  
+  for (let i = 1; i < points.length - 1; i++) {
+    const prev = points[i - 1];
+    const curr = points[i];
+    const next = points[i + 1];
+    
+    // Calculate smoothed point
+    smoothedPoints.push({
+      x: curr.x + (next.x - prev.x) * tension / 2,
+      y: curr.y + (next.y - prev.y) * tension / 2
+    });
+  }
+  
+  // Keep end point
+  smoothedPoints.push(points[points.length - 1]);
+  
+  return smoothedPoints;
+}
+
+function calculatePathLength(points: Point[]): number {
+  if (!points || points.length < 2) {
+    console.warn('Invalid path: insufficient points', points);
+    return 0;
+  }
+
+  let length = 0;
+  for (let i = 0; i < points.length - 1; i++) {
+    const p1 = points[i];
+    const p2 = points[i + 1];
+
+    // Validate point coordinates
+    if (!isValidPoint(p1) || !isValidPoint(p2)) {
+      console.warn('Invalid point coordinates at index', i, { p1, p2 });
+      continue;
+    }
+
+    const segmentLength = Math.sqrt(
+      Math.pow(p2.x - p1.x, 2) + Math.pow(p2.y - p1.y, 2)
+    );
+
+    if (isNaN(segmentLength)) {
+      console.warn('Invalid segment length at index', i, { p1, p2, segmentLength });
+      continue;
+    }
+
+    length += segmentLength;
+    console.log(`Segment ${i}: ${p1.x},${p1.y} -> ${p2.x},${p2.y} = ${segmentLength}`);
+  }
+
+  console.log('Final path length:', length);
+  return length;
+}
+
+// Helper function to validate point coordinates
+function isValidPoint(point: Point): boolean {
+  return (
+    point !== null &&
+    point !== undefined &&
+    typeof point.x === 'number' &&
+    typeof point.y === 'number' &&
+    !isNaN(point.x) &&
+    !isNaN(point.y) &&
+    isFinite(point.x) &&
+    isFinite(point.y)
+  );
 }
 
 async function toggleLockedAreaEraser() {
@@ -1494,6 +1691,30 @@ function isPointInShape(point: Point, shapeCoordinates: number[]): boolean {
   }
 
   return inside;
+}
+function projectPointOntoSegment(p: Point, a: Point, b: Point): Point {
+  const ax = p.x - a.x;
+  const ay = p.y - a.y;
+  const bx = b.x - a.x;
+  const by = b.y - a.y;
+  
+  const t = (ax * bx + ay * by) / (bx * bx + by * by);
+  
+  if (t < 0) return a;
+  if (t > 1) return b;
+  
+  return {
+    x: a.x + t * bx,
+    y: a.y + t * by
+  };
+}
+
+// Helper function to calculate distance between two points
+function getDistance(p1: Point, p2: Point): number {
+  return Math.sqrt(
+    Math.pow(p2.x - p1.x, 2) + 
+    Math.pow(p2.y - p1.y, 2)
+  );
 }
 </script>
 
